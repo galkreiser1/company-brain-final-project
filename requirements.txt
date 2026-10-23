@@ -1,0 +1,13 @@
+# Lesson 10 — Context Engineering
+# Standalone: everything this lab needs.
+boto3                     # Bedrock access (via langchain-aws); the server's Titan embeddings
+python-dotenv             # load the shared .env
+mcp<2                     # MCP SDK — pinned to 1.x because langchain-mcp-adapters does not
+                          # support mcp 2.0 yet (the version wall from Lesson 9's homework)
+faiss-cpu                 # local vector indexes for the server's two retrieval tools
+numpy                     # vector math for FAISS
+pydantic                  # the TurnPlan and ConversationMemory schemas
+langchain                 # chat-model interface and structured output
+langchain-aws             # ChatBedrockConverse — LangChain's wrapper over Bedrock Converse
+langgraph                 # StateGraph, checkpointer, conditional edges — every stage
+langchain-mcp-adapters    # load the MCP server's tools as LangChain tools
