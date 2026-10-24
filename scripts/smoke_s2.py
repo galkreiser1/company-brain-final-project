@@ -3,21 +3,32 @@
 Needs Lesson 10's MCP server running. Run from the repo root:
     .venv/bin/python -m scripts.smoke_s2
 
-For now it only connects to the server, lists its tools, and shows the turns it
-will send. The agent itself comes in the next step.
+All turns run on one thread_id, so they form one conversation. For each turn it
+prints which tools the model called, its answer, and how many messages are saved.
 """
 
 import asyncio
 import json
 
+from langchain_core.messages import HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from maya.config import MCP_SERVER_URL, REPO_ROOT
+from maya.graph import build_graph
+from maya.planning import message_text
 
 
 GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"
 SESSION_ID = "S2-onboarding-maya"
 TURNS_TO_RUN = 3
+
+# The conversation's ID. The checkpointer saves the state under it, so every turn sent
+# with the same thread_id continues the same conversation.
+THREAD_ID = "smoke-s2"
+
+# LangGraph counts every step it runs in a turn and stops the turn with an error past
+# this limit. It stops a model that keeps asking for tools from looping forever.
+RECURSION_LIMIT = 12
 
 
 async def load_tools() -> list:
@@ -37,15 +48,41 @@ def load_user_messages() -> list[str]:
     return [turn["user"] for turn in session["turns"][:TURNS_TO_RUN]]
 
 
+def print_turn(messages: list) -> None:
+    """Print the tools the model called in the latest turn, then its final answer."""
+
+    # The latest turn starts at the last user message.
+    turn_start = max(
+        index for index, message in enumerate(messages)
+        if isinstance(message, HumanMessage)
+    )
+    for message in messages[turn_start:]:
+        for call in getattr(message, "tool_calls", None) or []:
+            print(f"  tool:   {call['name']}({call['args']})")
+    print(f"  answer: {message_text(messages[-1])}")
+    print(f"  ({len(messages)} messages saved in this thread)")
+
+
 async def main() -> None:
     tools = await load_tools()
     print(f"{len(tools)} tools from {MCP_SERVER_URL}:")
     for tool in tools:
         print(f"  - {tool.name}")
 
-    print(f"\nTurns to send ({SESSION_ID}):")
-    for number, message in enumerate(load_user_messages(), start=1):
-        print(f"  {number}. {message}")
+    graph = build_graph(tools)
+
+    config = {
+        "configurable": {"thread_id": THREAD_ID},
+        "recursion_limit": RECURSION_LIMIT,
+    }
+
+    for number, user_message in enumerate(load_user_messages(), start=1):
+        print(f"\nTurn {number}: {user_message}")
+        # Only the new message is sent. The checkpointer adds the earlier ones.
+        result = await graph.ainvoke(
+            {"messages": [HumanMessage(user_message)]}, config=config,
+        )
+        print_turn(result["messages"])
 
 
 if __name__ == "__main__":
