@@ -120,16 +120,6 @@ def message_text(message) -> str:
     return str(content)
 
 
-def answer_messages(state: dict) -> list:
-    """What the answer call receives: the system prompt, then every saved message.
-
-    This is the simplest possible context, so it grows with every turn, old tool
-    results included.
-    """
-
-    return [SystemMessage(ASSISTANT_PROMPT), *state["messages"]]
-
-
 # HISTORY AS TEXT -------------------------------------------------------------
 # For a model that only needs to read the history: the planner.
 
@@ -201,3 +191,38 @@ def planner_messages(state: dict) -> list:
         f"User's newest message:\n{newest_message}"
     )
     return [SystemMessage(PLANNER_PROMPT), HumanMessage(prompt)]
+
+
+def _bullets(items: list[str]) -> str:
+    """Items as an indented bullet list, or "(none)" when there are no items."""
+
+    if not items:
+        return "  - (none)"
+    return "\n".join(f"  - {item}" for item in items)
+
+
+def render_plan(plan: TurnPlan) -> str:
+    """The plan as text, added to the end of the answer call's system prompt.
+
+    It includes the intent, facts, and constraints. `requires_tools` and
+    `action_confirmed` aren't included: the answer model doesn't need them.
+    """
+
+    return (
+        "\n\n--- CONTEXT FOR THIS TURN ---\n"
+        f"User's current intent: {plan.current_intent}\n"
+        f"Established facts you must use:\n{_bullets(plan.relevant_facts)}\n"
+        f"Constraints still in force:\n{_bullets(plan.relevant_constraints)}\n"
+        "--- END CONTEXT ---"
+    )
+
+
+def answer_messages(state: dict, plan: TurnPlan) -> list:
+    """What the answer call receives: the plan, plus every saved message.
+
+    - The system prompt is ASSISTANT_PROMPT with the plan added at the end.
+    - Then comes the whole conversation, which still grows with every turn.
+    """
+
+    system_prompt = ASSISTANT_PROMPT + render_plan(plan)
+    return [SystemMessage(system_prompt), *state["messages"]]
