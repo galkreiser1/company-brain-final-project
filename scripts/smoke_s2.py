@@ -23,7 +23,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from maya.config import MCP_SERVER_URL, REPO_ROOT
 from maya.graph import build_graph
-from maya.planning import ASSISTANT_PROMPT, message_text
+from maya.planning import ASSISTANT_PROMPT, message_text, render_transcript
 
 
 GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"
@@ -146,14 +146,13 @@ def check_turn(turn: dict, tool_calls: list, answer: str) -> list[tuple[str, boo
 
 # RUNNING ONE TURN ------------------------------------------------------------
 
-def latest_turn(messages: list) -> list:
-    """The messages of the latest turn: from the last user message to the end."""
+def latest_turn_start(messages: list) -> int:
+    """The index where the latest turn starts: its user message."""
 
-    turn_start = max(
+    return max(
         index for index, message in enumerate(messages)
         if isinstance(message, HumanMessage)
     )
-    return messages[turn_start:]
 
 
 async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict) -> dict:
@@ -164,9 +163,10 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict)
     result = await graph.ainvoke({"messages": [HumanMessage(turn["user"])]}, config=config)
 
     messages = result["messages"]
+    turn_start = latest_turn_start(messages)
     tool_calls = [
         call
-        for message in latest_turn(messages)
+        for message in messages[turn_start:]
         for call in getattr(message, "tool_calls", None) or []
     ]
     answer = message_text(messages[-1])
@@ -176,6 +176,8 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict)
         "checks": check_turn(turn, tool_calls, answer),
         "model_calls": recorder.calls[first_call:],
         "saved_messages": len(messages),
+        # The history before this turn, as text: what the planner will read (Step 5).
+        "transcript": render_transcript(messages[:turn_start]),
     }
 
 
@@ -258,6 +260,8 @@ def print_turn(number: int, outcome: dict) -> None:
     print(f"  checks:  {describe_checks(outcome['checks'])}")
     print(f"  cost:    {len(calls)} model calls · {input_tokens:,} input tokens · "
           f"up to {most_tools} tools shown · {outcome['saved_messages']} messages saved")
+    transcript = outcome["transcript"]
+    print(f"  history as text: {len(transcript):,} chars (~{len(transcript) // 4:,} tokens)")
     print(f"  answer:  {one_line(answer, 90, count_dropped=False)}")
 
 
@@ -267,6 +271,7 @@ How to read this log:
   - "Sent" is exactly what that call received; "Reply" is what it returned, in full.
   - ‹ASSISTANT_PROMPT› stands for that prompt's full text (see maya/planning.py).
   - Old answers and tool results are cut to {short} characters.
+  - HISTORY AS TEXT is render_transcript() of the turns before this one.
 """
 
 
@@ -294,6 +299,11 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
     status = "PASS" if turn_passed(outcome) else "FAIL"
     lines = [f"\n{rule}", f"TURN {number}  ·  {status}", rule]
     lines += ["USER", indent(outcome["turn"]["user"], 2)]
+    lines += [
+        "",
+        "HISTORY AS TEXT  ·  what the planner will read (from Step 5)",
+        indent(outcome["transcript"] or "(empty: first turn)", 2),
+    ]
 
     calls = outcome["model_calls"]
     for index, call in enumerate(calls, start=1):

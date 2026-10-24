@@ -1,5 +1,7 @@
 """What each model call receives: the prompts and the messages built from the state."""
 
+import json
+
 from langchain_core.messages import SystemMessage
 
 
@@ -52,3 +54,54 @@ def answer_messages(state: dict) -> list:
     """
 
     return [SystemMessage(ASSISTANT_PROMPT), *state["messages"]]
+
+
+# HISTORY AS TEXT -------------------------------------------------------------
+# For a model that only needs to read the history (the planner, from the next step).
+
+def _render_tool_result(message, tool_chars: int) -> str:
+    """One tool result as a line of text, cut to `tool_chars` characters."""
+
+    body = message_text(message)
+    if len(body) > tool_chars:
+        dropped = len(body) - tool_chars
+        body = body[:tool_chars] + f"... [+{dropped} chars dropped]"
+    tool_name = getattr(message, "name", "?")
+    return f"[tool result: {tool_name}] {body}"
+
+
+def _render_tool_calls(text: str, calls: list) -> str:
+    """Add "[called tool(args)]" for each tool call to a message's text."""
+
+    rendered_calls = []
+    for call in calls:
+        args = json.dumps(call["args"])[:120]  # long arguments are cut to 120 characters
+        rendered_calls.append(f"[called {call['name']}({args})]")
+
+    if text:
+        text = text + " "
+    return text + " ".join(rendered_calls)
+
+
+def render_transcript(messages: list, tool_chars: int = 400) -> str:
+    """Write the history out as plain text, for a model that only needs to read it.
+
+    Each line starts with the speaker: [human], [ai], or [tool result: name].
+    Each tool result is cut to `tool_chars` characters (400 by default). The first
+    400 characters usually hold the answer; the rest is mostly structure.
+    """
+
+    lines = []
+    for message in messages:
+        # HumanMessage -> "human", AIMessage -> "ai", ToolMessage -> "tool"
+        role = message.__class__.__name__.replace("Message", "").lower()
+        if role == "tool":
+            lines.append(_render_tool_result(message, tool_chars))
+            continue
+
+        text = message_text(message)
+        calls = getattr(message, "tool_calls", None) or []
+        if calls:
+            text = _render_tool_calls(text, calls)
+        lines.append(f"[{role}] {text}")
+    return "\n".join(lines)
