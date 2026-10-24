@@ -50,6 +50,9 @@ OUTPUT_FORMATS = {"TurnPlan"}
 # In the log, old answers and tool results are cut to this many characters.
 SHORT = 200
 
+# How many tools the MCP server has. Every step up to Step 7 showed all of them.
+TOOL_COUNT = 10
+
 
 # LOADING ---------------------------------------------------------------------
 
@@ -183,6 +186,7 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict)
     return {
         "turn": turn,
         "plan": result["plan"],
+        "loadout": result["loadout"],
         "tool_calls": tool_calls,
         "checks": check_turn(turn, result["plan"], tool_calls, answer),
         "model_calls": recorder.calls[first_call:],
@@ -292,6 +296,8 @@ def print_turn(number: int, outcome: dict) -> None:
           f"{one_line(outcome['turn']['user'], 70, count_dropped=False)}")
     print(f"  plan:    {plan['current_intent']} · {needs} · "
           f"facts: {len(plan['relevant_facts'])} · constraints: {len(plan['relevant_constraints'])}")
+    loadout = outcome["loadout"]
+    print(f"  loadout: {', '.join(loadout) or '(no tools)'} ({len(loadout)} of {TOOL_COUNT})")
     print(f"  tools:   {tools or '(none)'}")
     print(f"  checks:  {describe_checks(outcome['checks'])}")
     print(f"  cost:    {len(calls)} model calls ({per_step}) · {input_tokens:,} input tokens · "
@@ -305,7 +311,8 @@ LOG_INTRO = """\
 How to read this log:
   - Each turn lists every model call in the order it ran.
   - "Sent" is exactly what that call received; "Reply" is what it returned, in full.
-  - step: plan is the planner; step: model is the answer model.
+  - step: plan is the planner; step: model is the answer model. (select picks the
+    tools with plain code, so it makes no model call.)
   - ‹ASSISTANT_PROMPT› and ‹PLANNER_PROMPT› stand for those prompts' full text
     (see maya/planning.py).
   - Old answers and tool results are cut to {short} characters.

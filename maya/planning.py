@@ -67,7 +67,7 @@ INTENT_GLOSS = (
 
 
 class TurnPlan(BaseModel):
-    """The structured context plan for ONE user turn."""
+    """Stage 01's plan, plus the one field the write gate turns on."""
 
     current_intent: Intent = Field(description="Topic of the newest message.")
     relevant_facts: list[str] = Field(
@@ -84,6 +84,14 @@ class TurnPlan(BaseModel):
     requires_tools: bool = Field(
         description="False only if every fact needed is already in this conversation."
     )
+    action_confirmed: bool = Field(
+        default=False,
+        description=(
+            "True only if THIS message authorises creating or filing a record in a "
+            "system ('go ahead', 'file it'). Writing, drafting, summarising or "
+            "'write it up' is composing text, NOT authorisation to file anything."
+        ),
+    )
 
 
 PLANNER_PROMPT = (
@@ -99,7 +107,9 @@ PLANNER_PROMPT = (
     "You know nothing about NovaOps otherwise, so a first turn is almost always True.\n"
     "- A DIFFERENT TOPIC needs a different document. Having retrieved the VPN article "
     "does not answer a password question, and 'same kind of thing?' about a new topic "
-    "is still True. Only an answer you could quote from THIS conversation is False."
+    "is still True. Only an answer you could quote from THIS conversation is False.\n"
+    "- action_confirmed only when this message says to go ahead; then the intent is "
+    "access_request and requires_tools is True."
 )
 
 
