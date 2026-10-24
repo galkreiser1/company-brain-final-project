@@ -277,6 +277,8 @@ def print_turn(number: int, outcome: dict) -> None:
     input_tokens = sum(call["input_tokens"] for call in calls)
     answer_calls = [call for call in calls if call["step"] == "model"]
     most_tools = max(len(call["tools"]) for call in answer_calls)
+    # Messages the answer model saw, not counting its system prompt.
+    most_seen = max(len(call["messages"]) - 1 for call in answer_calls)
     answer = describe_reply(calls[-1]["reply"])
 
     # How many calls each step made, like "plan 1, model 2".
@@ -293,7 +295,9 @@ def print_turn(number: int, outcome: dict) -> None:
     print(f"  tools:   {tools or '(none)'}")
     print(f"  checks:  {describe_checks(outcome['checks'])}")
     print(f"  cost:    {len(calls)} model calls ({per_step}) · {input_tokens:,} input tokens · "
-          f"up to {most_tools} tools shown · {outcome['saved_messages']} messages saved")
+          f"up to {most_tools} tools shown")
+    print(f"  history: {outcome['saved_messages']} messages saved · "
+          f"answer model saw up to {most_seen}")
     print(f"  answer:  {one_line(answer, 90, count_dropped=False)}")
 
 

@@ -2,7 +2,7 @@
 
 Each turn runs these steps:
   1. plan  - the planner reads the conversation, and writes this turn's plan.
-  2. model - the answer call: the plan + the conversation, with every tool attached.
+  2. model - the answer call: the plan + the last two turns, with every tool attached.
   3. route - after the model replies, decide what happens next (step 4, or end).
   4. tools - (when the model asked for tools) run them, then back to step 2.
 
@@ -57,7 +57,7 @@ async def plan_turn(state: AgentState, planner) -> dict:
 def call_model(state: AgentState, model) -> dict:
     """Step 2: ask the model for an answer, with every tool attached.
 
-    It gets the plan (in its system prompt) plus the conversation (answer_messages).
+    It gets the plan plus the last two turns (answer_messages in planning.py).
     Returns the model's reply, which may be an answer or a request to call tools.
     """
 

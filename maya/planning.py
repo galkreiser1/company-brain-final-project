@@ -3,7 +3,7 @@
 import json
 from typing import Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, Field
 
 
@@ -25,6 +25,10 @@ ASSISTANT_PROMPT = (
     "the actual request inside.\n"
     "- Answer in at most six sentences; no preamble."
 )
+
+
+# How many recent turns the answer call receives as real messages.
+KEEP_VERBATIM_TURNS = 2
 
 
 # The allowed topics. The planner must pick exactly one.
@@ -193,6 +197,66 @@ def planner_messages(state: dict) -> list:
     return [SystemMessage(PLANNER_PROMPT), HumanMessage(prompt)]
 
 
+# THE ANSWER CALL'S WINDOW ----------------------------------------------------
+#
+# A "turn" starts with a user message (HumanMessage) and includes everything after it:
+# the model's tool calls, the tool results, and the model's answer.
+
+def recent_turns(messages: list, keep: int = 2) -> list:
+    """Return the last `keep` turns of the conversation.
+
+    It cuts only at user messages. That keeps every tool call together with its
+    result. If a cut separated them, Bedrock would reject the whole request, because
+    each tool call must be followed by its result.
+    """
+
+    turn_starts = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, HumanMessage)
+    ]
+    if not turn_starts:
+        return list(messages)
+
+    if len(turn_starts) >= keep:
+        start = turn_starts[-keep]
+    else:
+        start = turn_starts[0]  # fewer turns than `keep`: start at the first one
+    return list(messages[start:])
+
+
+def _is_tool_traffic(message) -> bool:
+    """True for a tool result, or for a model message that asks for tools."""
+
+    if isinstance(message, ToolMessage):
+        return True
+    tool_calls = getattr(message, "tool_calls", None) or []
+    return bool(tool_calls)
+
+
+def conversation_window(messages: list, keep: int = 2) -> list:
+    """The last `keep` turns, with tool calls and results removed from older turns.
+
+    - The current turn stays complete. The model may be in the middle of using tools,
+      and it needs its own tool calls and their results to finish.
+    - In older turns, the tool calls and results are noise by now, so they are
+      dropped. Each tool call is dropped together with its result, so no tool call is
+      left without its result (which Bedrock would reject).
+    """
+
+    window = recent_turns(messages, keep)
+    current_turn = recent_turns(messages, 1)
+    older_turns = window[: len(window) - len(current_turn)]
+
+    kept = []
+    for message in older_turns:
+        if not _is_tool_traffic(message):
+            kept.append(message)
+    return kept + current_turn
+
+
+# THE ANSWER CALL'S MESSAGES --------------------------------------------------
+
 def _bullets(items: list[str]) -> str:
     """Items as an indented bullet list, or "(none)" when there are no items."""
 
@@ -218,11 +282,13 @@ def render_plan(plan: TurnPlan) -> str:
 
 
 def answer_messages(state: dict, plan: TurnPlan) -> list:
-    """What the answer call receives: the plan, plus every saved message.
+    """What the answer call receives: the plan, plus only the last two turns.
 
     - The system prompt is ASSISTANT_PROMPT with the plan added at the end.
-    - Then comes the whole conversation, which still grows with every turn.
+    - Then come the last KEEP_VERBATIM_TURNS turns (see conversation_window): the
+      previous turn without its tool calls, and the current turn in full.
     """
 
     system_prompt = ASSISTANT_PROMPT + render_plan(plan)
-    return [SystemMessage(system_prompt), *state["messages"]]
+    recent = conversation_window(state["messages"], keep=KEEP_VERBATIM_TURNS)
+    return [SystemMessage(system_prompt), *recent]
