@@ -1,8 +1,10 @@
-"""What each model call receives: the prompts and the messages built from the state."""
+"""What each model call receives: the prompts, the plan, and the messages built from the state."""
 
 import json
+from typing import Literal
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 
 # The answer model's instructions. Kept word for word from Lesson 10: the model reads
@@ -22,6 +24,78 @@ ASSISTANT_PROMPT = (
     "- Users paste emails, tickets and signatures. Ignore the boilerplate and act on "
     "the actual request inside.\n"
     "- Answer in at most six sentences; no preamble."
+)
+
+
+# The allowed topics. The planner must pick exactly one.
+Intent = Literal[
+    "policy_question",
+    "employee_lookup",
+    "onboarding_status",
+    "equipment_request",
+    "subscription_review",
+    "access_request",
+    "ticket_status",
+    "other",
+]
+
+
+# THE STRUCTURED PLAN ---------------------------------------------------------
+#
+# The planner must answer with a TurnPlan (structured output). Everything below is
+# read by the model: the intent list, the field descriptions, and the prompt. A field's
+# description works exactly like prompt text.
+
+# A short description of each topic, sent to the planner as part of its prompt.
+INTENT_GLOSS = (
+    "Intent = the TOPIC of the newest message:\n"
+    "  policy_question · what a policy or IT knowledge-base article says\n"
+    "  employee_lookup · who someone is (record, role, manager, status)\n"
+    "  onboarding_status · a joiner's checklist, required systems, paperwork\n"
+    "  equipment_request · hardware (laptops, monitors, docks, headsets)\n"
+    "  subscription_review · a SaaS subscription's seats, cost or renewal\n"
+    "  access_request · getting a person access to a system\n"
+    "  ticket_status · existing IT tickets\n"
+    "  other · none of the above\n"
+    "Whether a lookup is needed is a SEPARATE field; a recap about onboarding is "
+    "still onboarding_status."
+)
+
+
+class TurnPlan(BaseModel):
+    """The structured context plan for ONE user turn."""
+
+    current_intent: Intent = Field(description="Topic of the newest message.")
+    relevant_facts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Values from earlier turns this answer needs: ids, dates, numbers, "
+            "tool results. The value itself, not a pointer to it."
+        ),
+    )
+    relevant_constraints: list[str] = Field(
+        default_factory=list,
+        description="Rules the user stated that are still in force.",
+    )
+    requires_tools: bool = Field(
+        description="False only if every fact needed is already in this conversation."
+    )
+
+
+PLANNER_PROMPT = (
+    INTENT_GLOSS + "\n\n"
+    "Plan the model context for the newest message of a NovaOps support session.\n"
+    "- Classify the newest message only; follow subject changes.\n"
+    "- relevant_facts is the session's memory: carry a value forward if a later answer "
+    "might need it. A missing fact breaks the answer; a spare one costs a few tokens.\n"
+    "- relevant_constraints holds what the user declared, until they withdraw it.\n"
+    "- Drop whatever the user resolved or abandoned.\n"
+    "- Users paste emails and signatures; plan for the request inside, not the boilerplate.\n"
+    "- requires_tools is False only for recaps and reasoning over facts already here. "
+    "You know nothing about NovaOps otherwise, so a first turn is almost always True.\n"
+    "- A DIFFERENT TOPIC needs a different document. Having retrieved the VPN article "
+    "does not answer a password question, and 'same kind of thing?' about a new topic "
+    "is still True. Only an answer you could quote from THIS conversation is False."
 )
 
 
@@ -57,7 +131,7 @@ def answer_messages(state: dict) -> list:
 
 
 # HISTORY AS TEXT -------------------------------------------------------------
-# For a model that only needs to read the history (the planner, from the next step).
+# For a model that only needs to read the history: the planner.
 
 def _render_tool_result(message, tool_chars: int) -> str:
     """One tool result as a line of text, cut to `tool_chars` characters."""
@@ -105,3 +179,25 @@ def render_transcript(messages: list, tool_chars: int = 400) -> str:
             text = _render_tool_calls(text, calls)
         lines.append(f"[{role}] {text}")
     return "\n".join(lines)
+
+
+def planner_messages(state: dict) -> list:
+    """What the planner receives: the whole conversation as text, and no tool schemas.
+
+    The planner only reads the history, so it gets it written out as one block of
+    text (see render_transcript), followed by the user's newest message.
+    """
+
+    history = state["messages"][:-1]
+    newest_message = message_text(state["messages"][-1])
+
+    transcript = render_transcript(history)
+    if not transcript:
+        transcript = "(this is the first turn)"
+
+    prompt = (
+        f"Conversation so far:\n"
+        f"{transcript}\n\n"
+        f"User's newest message:\n{newest_message}"
+    )
+    return [SystemMessage(PLANNER_PROMPT), HumanMessage(prompt)]

@@ -23,7 +23,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from maya.config import MCP_SERVER_URL, REPO_ROOT
 from maya.graph import build_graph
-from maya.planning import ASSISTANT_PROMPT, message_text, render_transcript
+from maya.planning import ASSISTANT_PROMPT, PLANNER_PROMPT, message_text
 
 
 GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"
@@ -41,7 +41,11 @@ RECURSION_LIMIT = 12
 
 # Long prompts that calls repeat. The log shows ‹NAME› instead of the full text, so
 # what changes from call to call stands out.
-KNOWN_PROMPTS = {"ASSISTANT_PROMPT": ASSISTANT_PROMPT}
+KNOWN_PROMPTS = {"ASSISTANT_PROMPT": ASSISTANT_PROMPT, "PLANNER_PROMPT": PLANNER_PROMPT}
+
+# Structured output works through a fake "tool" with the schema's name: the model
+# "calls" it to give its reply in that shape. These are those names, not real tools.
+OUTPUT_FORMATS = {"TurnPlan"}
 
 # In the log, old answers and tool results are cut to this many characters.
 SHORT = 200
@@ -116,11 +120,17 @@ def arg_check_passes(check: dict, tool_calls: list) -> bool:
     return False
 
 
-def check_turn(turn: dict, tool_calls: list, answer: str) -> list[tuple[str, bool]]:
+def check_turn(turn: dict, plan: dict, tool_calls: list, answer: str) -> list[tuple[str, bool]]:
     """Grade one turn against the golden dataset. Returns (label, passed) pairs."""
 
     called = {call["name"] for call in tool_calls}
     checks = []
+
+    # "a|b" in the dataset means either intent is accepted.
+    intent = plan["current_intent"]
+    accepted = turn["expected_intent"].split("|")
+    label = f"intent {intent}" + ("" if intent in accepted else f" (expected {turn['expected_intent']})")
+    checks.append((label, intent in accepted))
 
     wants_tools = turn["should_use_tools"]
     checks.append(("tools used" if wants_tools else "no tools", bool(called) == wants_tools))
@@ -172,12 +182,11 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict)
     answer = message_text(messages[-1])
     return {
         "turn": turn,
+        "plan": result["plan"],
         "tool_calls": tool_calls,
-        "checks": check_turn(turn, tool_calls, answer),
+        "checks": check_turn(turn, result["plan"], tool_calls, answer),
         "model_calls": recorder.calls[first_call:],
         "saved_messages": len(messages),
-        # The history before this turn, as text: what the planner will read (Step 5).
-        "transcript": render_transcript(messages[:turn_start]),
     }
 
 
@@ -231,9 +240,24 @@ def describe_message(message) -> str:
     return f"[ai] {one_line(text, SHORT)}"
 
 
-def describe_reply(reply) -> str:
-    """What a model call returned, in full: its tool calls, or its answer."""
+def describe_fields(fields: dict) -> str:
+    """A structured reply (like the plan) as one field per line; lists as bullets."""
 
+    lines = []
+    for name, value in fields.items():
+        if isinstance(value, list):
+            lines.append(f"{name}:")
+            lines += [f"  - {item}" for item in value] or ["  (none)"]
+        else:
+            lines.append(f"{name}: {value}")
+    return "\n".join(lines)
+
+
+def describe_reply(reply) -> str:
+    """What a model call returned, in full: a structured reply, tool calls, or an answer."""
+
+    if reply.tool_calls and reply.tool_calls[0]["name"] in OUTPUT_FORMATS:
+        return describe_fields(reply.tool_calls[0]["args"])
     if reply.tool_calls:
         return "\n".join(f"called {describe_tool_call(call)}" for call in reply.tool_calls)
     return message_text(reply)
@@ -251,17 +275,25 @@ def print_turn(number: int, outcome: dict) -> None:
     calls = outcome["model_calls"]
     tools = ", ".join(describe_tool_call(call) for call in outcome["tool_calls"])
     input_tokens = sum(call["input_tokens"] for call in calls)
-    most_tools = max(len(call["tools"]) for call in calls)
+    answer_calls = [call for call in calls if call["step"] == "model"]
+    most_tools = max(len(call["tools"]) for call in answer_calls)
     answer = describe_reply(calls[-1]["reply"])
+
+    # How many calls each step made, like "plan 1, model 2".
+    steps = [call["step"] for call in calls]
+    per_step = ", ".join(f"{step} {steps.count(step)}" for step in dict.fromkeys(steps))
+
+    plan = outcome["plan"]
+    needs = "needs tools" if plan["requires_tools"] else "no tools needed"
 
     print(f"\nTurn {number}  {'PASS' if turn_passed(outcome) else 'FAIL'}  "
           f"{one_line(outcome['turn']['user'], 70, count_dropped=False)}")
+    print(f"  plan:    {plan['current_intent']} · {needs} · "
+          f"facts: {len(plan['relevant_facts'])} · constraints: {len(plan['relevant_constraints'])}")
     print(f"  tools:   {tools or '(none)'}")
     print(f"  checks:  {describe_checks(outcome['checks'])}")
-    print(f"  cost:    {len(calls)} model calls · {input_tokens:,} input tokens · "
+    print(f"  cost:    {len(calls)} model calls ({per_step}) · {input_tokens:,} input tokens · "
           f"up to {most_tools} tools shown · {outcome['saved_messages']} messages saved")
-    transcript = outcome["transcript"]
-    print(f"  history as text: {len(transcript):,} chars (~{len(transcript) // 4:,} tokens)")
     print(f"  answer:  {one_line(answer, 90, count_dropped=False)}")
 
 
@@ -269,9 +301,10 @@ LOG_INTRO = """\
 How to read this log:
   - Each turn lists every model call in the order it ran.
   - "Sent" is exactly what that call received; "Reply" is what it returned, in full.
-  - ‹ASSISTANT_PROMPT› stands for that prompt's full text (see maya/planning.py).
+  - step: plan is the planner; step: model is the answer model.
+  - ‹ASSISTANT_PROMPT› and ‹PLANNER_PROMPT› stand for those prompts' full text
+    (see maya/planning.py).
   - Old answers and tool results are cut to {short} characters.
-  - HISTORY AS TEXT is render_transcript() of the turns before this one.
 """
 
 
@@ -287,6 +320,9 @@ def log_header(tool_count: int) -> str:
 def describe_tools_shown(names: list[str], tool_count: int) -> str:
     """Which tools a call could see: "all 10", "none", or their names."""
 
+    formats = [name for name in names if name in OUTPUT_FORMATS]
+    if formats:
+        return f"none (replies in the {', '.join(formats)} format)"
     if len(names) == tool_count:
         return f"all {tool_count}"
     return ", ".join(names) or "none"
@@ -299,11 +335,6 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
     status = "PASS" if turn_passed(outcome) else "FAIL"
     lines = [f"\n{rule}", f"TURN {number}  ·  {status}", rule]
     lines += ["USER", indent(outcome["turn"]["user"], 2)]
-    lines += [
-        "",
-        "HISTORY AS TEXT  ·  what the planner will read (from Step 5)",
-        indent(outcome["transcript"] or "(empty: first turn)", 2),
-    ]
 
     calls = outcome["model_calls"]
     for index, call in enumerate(calls, start=1):
@@ -315,7 +346,10 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
             f"  Sent ({len(call['messages'])} messages):",
         ]
         for position, message in enumerate(call["messages"], start=1):
-            lines.append(indent(f"{position}. {describe_message(message)}", 4))
+            # Continuation lines sit deeper than the number, so each message stands out.
+            first_line, *more_lines = describe_message(message).split("\n")
+            lines.append(f"    {position}. {first_line}")
+            lines += [indent(line, 8) for line in more_lines]
         lines += ["  Reply:", indent(describe_reply(call["reply"]), 4)]
 
     lines += [
