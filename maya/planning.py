@@ -66,8 +66,10 @@ INTENT_GLOSS = (
 )
 
 
+# The docstring is sent to the planner as the schema's description, so it is kept word
+# for word from Lesson 10's stage 3 (whose TurnPlan is stage 2's with this docstring).
 class TurnPlan(BaseModel):
-    """Stage 01's plan, plus the one field the write gate turns on."""
+    """Unchanged from stage 02 — what THIS turn needs."""
 
     current_intent: Intent = Field(description="Topic of the newest message.")
     relevant_facts: list[str] = Field(
@@ -135,7 +137,7 @@ def message_text(message) -> str:
 
 
 # HISTORY AS TEXT -------------------------------------------------------------
-# For a model that only needs to read the history: the planner.
+# For models that only need to read the history: the planner and the distiller.
 
 def _render_tool_result(message, tool_chars: int) -> str:
     """One tool result as a line of text, cut to `tool_chars` characters."""
@@ -183,28 +185,6 @@ def render_transcript(messages: list, tool_chars: int = 400) -> str:
             text = _render_tool_calls(text, calls)
         lines.append(f"[{role}] {text}")
     return "\n".join(lines)
-
-
-def planner_messages(state: dict) -> list:
-    """What the planner receives: the whole conversation as text, and no tool schemas.
-
-    The planner only reads the history, so it gets it written out as one block of
-    text (see render_transcript), followed by the user's newest message.
-    """
-
-    history = state["messages"][:-1]
-    newest_message = message_text(state["messages"][-1])
-
-    transcript = render_transcript(history)
-    if not transcript:
-        transcript = "(this is the first turn)"
-
-    prompt = (
-        f"Conversation so far:\n"
-        f"{transcript}\n\n"
-        f"User's newest message:\n{newest_message}"
-    )
-    return [SystemMessage(PLANNER_PROMPT), HumanMessage(prompt)]
 
 
 # THE ANSWER CALL'S WINDOW ----------------------------------------------------

@@ -3,7 +3,7 @@
 Each turn runs these steps:
   1. check  - is it time to distil? (enough new messages since the last time)
   2. distil - (only when step 1 says yes) turn the new messages into updated memory.
-  3. plan   - the planner reads the conversation, and writes this turn's plan.
+  3. plan   - the planner reads the memory + newer messages, and writes the plan.
   4. select - plain code picks the turn's loadout (the tools the model may see).
   5. model  - the answer call: the plan + the last two turns, with only the loadout's
               tools attached.
@@ -30,9 +30,10 @@ from maya.memory import (
     distiller_messages,
     memory_is_safe,
     needs_distillation,
+    planner_messages,
 )
 from maya.model import get_model
-from maya.planning import TurnPlan, answer_messages, planner_messages, recent_turns
+from maya.planning import TurnPlan, answer_messages, recent_turns
 
 
 # STATE -----------------------------------------------------------------------
@@ -75,8 +76,8 @@ async def distil(state: AgentState, distiller) -> dict:
     - Sends the old memory plus every message since it to the distiller.
     - Keeps the new memory only if memory_is_safe() accepts it. Otherwise nothing
       changes: the old memory and every message stay as they were.
-    - Never deletes a message. It only moves `distilled_upto`, to mark which messages
-      the memory now covers.
+    - Never deletes a message. It only moves `distilled_upto`, so the planner stops
+      reading the messages that are now in the memory.
     """
 
     result = await distiller.ainvoke(distiller_messages(state))
@@ -95,8 +96,8 @@ async def distil(state: AgentState, distiller) -> dict:
 async def plan_turn(state: AgentState, planner) -> dict:
     """Step 3: ask the planner for this turn's plan, and save it in the state.
 
-    The planner gets the whole conversation as text (planner_messages in
-    planning.py). If its answer can't be read as a TurnPlan, use a fallback plan:
+    The planner gets the memory plus only the newer messages (planner_messages in
+    memory.py). If its answer can't be read as a TurnPlan, use a fallback plan:
     topic "other", tools needed.
     """
 
