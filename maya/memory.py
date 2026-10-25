@@ -7,8 +7,8 @@ changes what the planner is sent.
 
 Ordered by the graph step that uses each piece:
   check  - DISTIL_AFTER_* and needs_distillation: is it time to distil?
-  distil - ConversationMemory, DISTIL_PROMPT, render_memory and distiller_messages:
-           build the new memory.
+  distil - ConversationMemory, DISTIL_PROMPT, render_memory, distiller_messages and
+           memory_is_safe: build the new memory, then check it before trusting it.
 """
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -40,7 +40,7 @@ def needs_distillation(state: dict) -> bool:
     return estimate_tokens(render_transcript(fresh)) >= DISTIL_AFTER_TOKENS
 
 
-# DISTIL: BUILD THE MEMORY ----------------------------------------------------
+# DISTIL: BUILD THE MEMORY, AND CHECK IT -------------------------------------
 #
 # The distiller must answer with a ConversationMemory (structured output). The field
 # descriptions and DISTIL_PROMPT are read by the model, so they're kept word for word.
@@ -127,3 +127,18 @@ def distiller_messages(state: dict) -> list:
         f"Conversation since then:\n{render_transcript(fresh)}"
     )
     return [SystemMessage(DISTIL_PROMPT), HumanMessage(prompt)]
+
+
+def memory_is_safe(old: dict, new: ConversationMemory) -> bool:
+    """Check a new memory before using it. Returns False to reject it.
+
+    Rejects it if:
+      - it's empty (no facts, no decisions, no open items), or
+      - it has fewer active constraints than the old memory (a sign it dropped one).
+    A rejected memory loses nothing: the old memory and all raw messages stay.
+    """
+
+    if not (new.important_facts or new.decisions or new.unresolved_items):
+        return False
+    old_constraints = old.get("active_constraints", [])
+    return len(new.active_constraints) >= len(old_constraints)

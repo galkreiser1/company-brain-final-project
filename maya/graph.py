@@ -25,7 +25,12 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from maya.loadout import WRITE_TOOLS, select_tools
-from maya.memory import ConversationMemory, distiller_messages, needs_distillation
+from maya.memory import (
+    ConversationMemory,
+    distiller_messages,
+    memory_is_safe,
+    needs_distillation,
+)
 from maya.model import get_model
 from maya.planning import TurnPlan, answer_messages, planner_messages, recent_turns
 
@@ -68,14 +73,17 @@ async def distil(state: AgentState, distiller) -> dict:
     """Step 2 (only when step 1 says so): turn the new messages into updated memory.
 
     - Sends the old memory plus every message since it to the distiller.
-    - If its answer can't be read as a ConversationMemory, nothing changes.
+    - Keeps the new memory only if memory_is_safe() accepts it. Otherwise nothing
+      changes: the old memory and every message stay as they were.
     - Never deletes a message. It only moves `distilled_upto`, to mark which messages
       the memory now covers.
     """
 
     result = await distiller.ainvoke(distiller_messages(state))
     new_memory = result["parsed"]
-    if new_memory is None:
+    old_memory = state.get("memory") or {}
+
+    if new_memory is None or not memory_is_safe(old_memory, new_memory):
         return {}
 
     return {

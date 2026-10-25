@@ -178,6 +178,8 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict)
     """Send one user message, then collect what happened in that turn."""
 
     first_call = len(recorder.calls)
+    # Where the memory ended before this turn, to tell if a distil was kept or rejected.
+    before = (await graph.aget_state(config)).values.get("distilled_upto", 0)
     # Only the new message is sent. The checkpointer adds the earlier ones.
     result = await graph.ainvoke({"messages": [HumanMessage(turn["user"])]}, config=config)
 
@@ -199,6 +201,7 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict)
         "saved_messages": len(messages),
         "memory": result.get("memory") or {},
         "distilled_upto": result.get("distilled_upto", 0),
+        "distilled_upto_before": before,
         # The messages the memory doesn't cover yet: what the next check counts.
         "fresh": messages[result.get("distilled_upto", 0):],
     }
@@ -244,6 +247,8 @@ def describe_memory(outcome: dict) -> str:
     """One line on the memory: distilled this turn, or how close the next check is."""
 
     if any(call["step"] == "distil" for call in outcome["model_calls"]):
+        if outcome["distilled_upto"] == outcome["distilled_upto_before"]:
+            return "distil REJECTED by memory_is_safe ✗ · old memory and all messages kept"
         return f"distilled this turn ✓ · covers messages 1-{outcome['distilled_upto']}"
 
     fresh = outcome["fresh"]
