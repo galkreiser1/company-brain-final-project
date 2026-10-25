@@ -22,8 +22,10 @@ from langchain_core.messages import HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from maya.config import MCP_SERVER_URL, REPO_ROOT
+import maya.memory
 from maya.graph import build_graph
-from maya.planning import ASSISTANT_PROMPT, PLANNER_PROMPT, message_text
+from maya.memory import DISTIL_PROMPT, estimate_tokens, render_memory
+from maya.planning import ASSISTANT_PROMPT, PLANNER_PROMPT, message_text, render_transcript
 
 
 GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"
@@ -41,11 +43,15 @@ RECURSION_LIMIT = 12
 
 # Long prompts that calls repeat. The log shows ‹NAME› instead of the full text, so
 # what changes from call to call stands out.
-KNOWN_PROMPTS = {"ASSISTANT_PROMPT": ASSISTANT_PROMPT, "PLANNER_PROMPT": PLANNER_PROMPT}
+KNOWN_PROMPTS = {
+    "ASSISTANT_PROMPT": ASSISTANT_PROMPT,
+    "PLANNER_PROMPT": PLANNER_PROMPT,
+    "DISTIL_PROMPT": DISTIL_PROMPT,
+}
 
 # Structured output works through a fake "tool" with the schema's name: the model
 # "calls" it to give its reply in that shape. These are those names, not real tools.
-OUTPUT_FORMATS = {"TurnPlan"}
+OUTPUT_FORMATS = {"TurnPlan", "ConversationMemory"}
 
 # In the log, old answers and tool results are cut to this many characters.
 SHORT = 200
@@ -191,6 +197,10 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict)
         "checks": check_turn(turn, result["plan"], tool_calls, answer),
         "model_calls": recorder.calls[first_call:],
         "saved_messages": len(messages),
+        "memory": result.get("memory") or {},
+        "distilled_upto": result.get("distilled_upto", 0),
+        # The messages the memory doesn't cover yet: what the next check counts.
+        "fresh": messages[result.get("distilled_upto", 0):],
     }
 
 
@@ -228,6 +238,26 @@ def was_rearmed(call: dict, calls: list) -> bool:
     """
 
     return call["step"] == "model" and not call["reply"].tool_calls and call is not calls[-1]
+
+
+def describe_memory(outcome: dict) -> str:
+    """One line on the memory: distilled this turn, or how close the next check is."""
+
+    if any(call["step"] == "distil" for call in outcome["model_calls"]):
+        return f"distilled this turn ✓ · covers messages 1-{outcome['distilled_upto']}"
+
+    fresh = outcome["fresh"]
+    tokens = estimate_tokens(render_transcript(fresh))
+    status = "saved" if outcome["memory"] else "none yet"
+    # Read the limits from the module, so a demo that lowers them shows the new values.
+    max_messages = maya.memory.DISTIL_AFTER_MESSAGES
+    max_tokens = maya.memory.DISTIL_AFTER_TOKENS
+    # The next turn's check also counts that turn's user message, hence the + 1.
+    next_turn = " → next turn distils" if len(fresh) + 1 >= max_messages or tokens >= max_tokens else ""
+    return (
+        f"{status} · since last distil: {len(fresh)}/{max_messages} messages, "
+        f"~{tokens:,}/{max_tokens:,} tokens{next_turn}"
+    )
 
 
 def turn_passed(outcome: dict) -> bool:
@@ -313,6 +343,7 @@ def print_turn(number: int, outcome: dict) -> None:
           f"up to {most_tools} tools shown")
     print(f"  history: {outcome['saved_messages']} messages saved · "
           f"answer model saw up to {most_seen}")
+    print(f"  memory:  {describe_memory(outcome)}")
     rearms = sum(was_rearmed(call, calls) for call in calls)
     print(f"  rearms:  {rearms}" + (" (an answer without a lookup was deleted and retried)" if rearms else ""))
     print(f"  answer:  {one_line(answer, 90, count_dropped=False)}")
@@ -322,10 +353,12 @@ LOG_INTRO = """\
 How to read this log:
   - Each turn lists every model call in the order it ran.
   - "Sent" is exactly what that call received; "Reply" is what it returned, in full.
-  - step: plan is the planner; step: model is the answer model. (select picks the
-    tools and rearm resets them with plain code, so they make no model call.)
-  - ‹ASSISTANT_PROMPT› and ‹PLANNER_PROMPT› stand for those prompts' full text
-    (see maya/planning.py).
+  - step: distil is the distiller (only on turns that distil); step: plan is the
+    planner; step: model is the answer model. (select picks the tools and rearm
+    resets them with plain code, so they make no model call.)
+  - ‹ASSISTANT_PROMPT›, ‹PLANNER_PROMPT› and ‹DISTIL_PROMPT› stand for those
+    prompts' full text (see maya/planning.py and maya/memory.py).
+  - MEMORY at the end of a turn shows the saved notes, when there are any.
   - Old answers and tool results are cut to {short} characters.
 """
 
@@ -381,7 +414,10 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
         "",
         f"CHECKS  {describe_checks(outcome['checks'])}",
         f"STATE   {outcome['saved_messages']} messages saved in thread {THREAD_ID}",
+        f"MEMORY  {describe_memory(outcome)}",
     ]
+    if outcome["memory"]:
+        lines.append(indent(render_memory(outcome["memory"]), 2))
     return "\n".join(lines) + "\n"
 
 

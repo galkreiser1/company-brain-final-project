@@ -1,13 +1,15 @@
 """The Maya agent's graph: its state, its steps in run order, and the wiring.
 
 Each turn runs these steps:
-  1. plan   - the planner reads the conversation, and writes this turn's plan.
-  2. select - plain code picks the turn's loadout (the tools the model may see).
-  3. model  - the answer call: the plan + the last two turns, with only the loadout's
+  1. check  - is it time to distil? (enough new messages since the last time)
+  2. distil - (only when step 1 says yes) turn the new messages into updated memory.
+  3. plan   - the planner reads the conversation, and writes this turn's plan.
+  4. select - plain code picks the turn's loadout (the tools the model may see).
+  5. model  - the answer call: the plan + the last two turns, with only the loadout's
               tools attached.
-  4. route  - after the model replies, decide what happens next (5a, 5b, or end).
-  5a. tools - (when the model asked for tools) run them, then back to step 3.
-  5b. rearm - (when a needed lookup was missed) delete that answer, and retry step 3
+  6. route  - after the model replies, decide what happens next (7a, 7b, or end).
+  7a. tools - (when the model asked for tools) run them, then back to step 5.
+  7b. rearm - (when a needed lookup was missed) delete that answer, and retry step 5
               once with every read tool.
 
 Read in this order: AgentState, then the steps, then build_graph at the bottom.
@@ -23,6 +25,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from maya.loadout import WRITE_TOOLS, select_tools
+from maya.memory import ConversationMemory, distiller_messages, needs_distillation
 from maya.model import get_model
 from maya.planning import TurnPlan, answer_messages, planner_messages, recent_turns
 
@@ -41,14 +44,48 @@ class AgentState(TypedDict):
     plan: dict                              # this turn's plan (a TurnPlan, as a dict)
     loadout: list[str]                      # tools the model may see this turn
     rearmed: bool                           # has this turn's fallback been used?
+    memory: dict                            # the notes (a ConversationMemory, as a dict)
+    distilled_upto: int                     # messages before this index are in the memory
 
 
 # THE STEPS -------------------------------------------------------------------
 # Each step gets the state, plus whatever build_graph() passes in, and returns only
 # the state fields it changes.
 
+def distil_or_plan(state: AgentState) -> str:
+    """Step 1: at the start of a turn, decide whether to distil first.
+
+    Returns "distil" if enough new messages have piled up (see needs_distillation),
+    otherwise "plan". Most turns skip distillation, so it costs nothing on them.
+    """
+
+    if needs_distillation(state):
+        return "distil"
+    return "plan"
+
+
+async def distil(state: AgentState, distiller) -> dict:
+    """Step 2 (only when step 1 says so): turn the new messages into updated memory.
+
+    - Sends the old memory plus every message since it to the distiller.
+    - If its answer can't be read as a ConversationMemory, nothing changes.
+    - Never deletes a message. It only moves `distilled_upto`, to mark which messages
+      the memory now covers.
+    """
+
+    result = await distiller.ainvoke(distiller_messages(state))
+    new_memory = result["parsed"]
+    if new_memory is None:
+        return {}
+
+    return {
+        "memory": new_memory.model_dump(),
+        "distilled_upto": len(state["messages"]),  # everything so far is now in memory
+    }
+
+
 async def plan_turn(state: AgentState, planner) -> dict:
-    """Step 1: ask the planner for this turn's plan, and save it in the state.
+    """Step 3: ask the planner for this turn's plan, and save it in the state.
 
     The planner gets the whole conversation as text (planner_messages in
     planning.py). If its answer can't be read as a TurnPlan, use a fallback plan:
@@ -63,7 +100,7 @@ async def plan_turn(state: AgentState, planner) -> dict:
 
 
 def select(state: AgentState, all_tool_names: list[str]) -> dict:
-    """Step 2: turn the plan into this turn's loadout. No model call.
+    """Step 4: turn the plan into this turn's loadout. No model call.
 
     select_tools() returns a list of tool names ([] means none), or None for topic
     "other", which means every tool. Note: "every tool" includes the write tool.
@@ -88,7 +125,7 @@ def model_with_tools(base_model, tools_by_name: dict, names: list[str]):
 
 
 def call_model(state: AgentState, base_model, tools_by_name: dict) -> dict:
-    """Step 3: ask the model for an answer, with only the loadout's tools.
+    """Step 5: ask the model for an answer, with only the loadout's tools.
 
     It gets the plan plus the last two turns (answer_messages in planning.py).
     Returns the model's reply, which may be an answer or a request to call tools.
@@ -119,10 +156,10 @@ def lookup_was_missed(state: AgentState) -> bool:
 
 
 def route(state: AgentState) -> str:
-    """Step 4: after the model replies, choose the next step.
+    """Step 6: after the model replies, choose the next step.
 
-    - The model asked for tools          -> "tools" (step 5a)
-    - It answered, but missed a lookup   -> "rearm" (step 5b, retry once)
+    - The model asked for tools          -> "tools" (step 7a)
+    - It answered, but missed a lookup   -> "rearm" (step 7b, retry once)
     - It answered                        -> END (the turn is over)
     """
 
@@ -134,7 +171,7 @@ def route(state: AgentState) -> str:
 
 
 def rearm(state: AgentState, all_tool_names: list[str]) -> dict:
-    """Step 5b (only when a lookup was missed): retry once with every read tool.
+    """Step 7b (only when a lookup was missed): retry once with every read tool.
 
     - Loadout: every read tool. The write tool stays only if it was already allowed
       this turn, so a retry can never be what turns the write on.
@@ -169,20 +206,25 @@ def build_graph(tools: list):
     # The planner must reply with a TurnPlan. include_raw=True returns a dict whose
     # "parsed" is None when the reply can't be read as one, instead of raising an error.
     planner = get_model().with_structured_output(TurnPlan, include_raw=True)
+    distiller = get_model().with_structured_output(ConversationMemory, include_raw=True)
 
     graph = StateGraph(AgentState)
+    graph.add_node("distil", partial(distil, distiller=distiller))
     graph.add_node("plan", partial(plan_turn, planner=planner))
     graph.add_node("select", partial(select, all_tool_names=all_tool_names))
     graph.add_node("model", partial(
         call_model, base_model=base_model, tools_by_name=tools_by_name,
     ))
     graph.add_node("rearm", partial(rearm, all_tool_names=all_tool_names))
-    # Step 5a: LangGraph's ToolNode runs the tools the model asked for.
+    # Step 7a: LangGraph's ToolNode runs the tools the model asked for.
     graph.add_node("tools", ToolNode(tools))
 
-    # START -> plan -> select -> model, then model -> tools / rearm / END, and tools
-    # and rearm both go back to model.
-    graph.add_edge(START, "plan")
+    # START -> (distil) -> plan -> select -> model, then model -> tools / rearm / END,
+    # and tools and rearm both go back to model.
+    graph.add_conditional_edges(
+        START, distil_or_plan, {"distil": "distil", "plan": "plan"},
+    )
+    graph.add_edge("distil", "plan")
     graph.add_edge("plan", "select")
     graph.add_edge("select", "model")
     graph.add_conditional_edges(
