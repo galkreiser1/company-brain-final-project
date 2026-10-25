@@ -221,6 +221,15 @@ def describe_checks(checks: list) -> str:
     return " · ".join(f"{label} {'✓' if passed else '✗'}" for label, passed in checks)
 
 
+def was_rearmed(call: dict, calls: list) -> bool:
+    """True for an answer that rearm deleted: written without tools, but not the last call.
+
+    Only rearm makes the graph call the model again after a plain answer.
+    """
+
+    return call["step"] == "model" and not call["reply"].tool_calls and call is not calls[-1]
+
+
 def turn_passed(outcome: dict) -> bool:
     return all(passed for _, passed in outcome["checks"])
 
@@ -304,6 +313,8 @@ def print_turn(number: int, outcome: dict) -> None:
           f"up to {most_tools} tools shown")
     print(f"  history: {outcome['saved_messages']} messages saved · "
           f"answer model saw up to {most_seen}")
+    rearms = sum(was_rearmed(call, calls) for call in calls)
+    print(f"  rearms:  {rearms}" + (" (an answer without a lookup was deleted and retried)" if rearms else ""))
     print(f"  answer:  {one_line(answer, 90, count_dropped=False)}")
 
 
@@ -312,7 +323,7 @@ How to read this log:
   - Each turn lists every model call in the order it ran.
   - "Sent" is exactly what that call received; "Reply" is what it returned, in full.
   - step: plan is the planner; step: model is the answer model. (select picks the
-    tools with plain code, so it makes no model call.)
+    tools and rearm resets them with plain code, so they make no model call.)
   - ‹ASSISTANT_PROMPT› and ‹PLANNER_PROMPT› stand for those prompts' full text
     (see maya/planning.py).
   - Old answers and tool results are cut to {short} characters.
@@ -361,7 +372,10 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
             first_line, *more_lines = describe_message(message).split("\n")
             lines.append(f"    {position}. {first_line}")
             lines += [indent(line, 8) for line in more_lines]
-        lines += ["  Reply:", indent(describe_reply(call["reply"]), 4)]
+        reply_label = "  Reply:"
+        if was_rearmed(call, calls):
+            reply_label = "  Reply (DELETED by rearm: no lookup happened; the user never saw it):"
+        lines += [reply_label, indent(describe_reply(call["reply"]), 4)]
 
     lines += [
         "",

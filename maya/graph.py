@@ -5,8 +5,10 @@ Each turn runs these steps:
   2. select - plain code picks the turn's loadout (the tools the model may see).
   3. model  - the answer call: the plan + the last two turns, with only the loadout's
               tools attached.
-  4. route  - after the model replies, decide what happens next (step 5, or end).
-  5. tools  - (when the model asked for tools) run them, then back to step 3.
+  4. route  - after the model replies, decide what happens next (5a, 5b, or end).
+  5a. tools - (when the model asked for tools) run them, then back to step 3.
+  5b. rearm - (when a needed lookup was missed) delete that answer, and retry step 3
+              once with every read tool.
 
 Read in this order: AgentState, then the steps, then build_graph at the bottom.
 """
@@ -14,14 +16,15 @@ Read in this order: AgentState, then the steps, then build_graph at the bottom.
 from functools import partial
 from typing import Annotated, TypedDict
 
+from langchain_core.messages import RemoveMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from maya.loadout import select_tools
+from maya.loadout import WRITE_TOOLS, select_tools
 from maya.model import get_model
-from maya.planning import TurnPlan, answer_messages, planner_messages
+from maya.planning import TurnPlan, answer_messages, planner_messages, recent_turns
 
 
 # STATE -----------------------------------------------------------------------
@@ -37,6 +40,7 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]  # the whole conversation
     plan: dict                              # this turn's plan (a TurnPlan, as a dict)
     loadout: list[str]                      # tools the model may see this turn
+    rearmed: bool                           # has this turn's fallback been used?
 
 
 # THE STEPS -------------------------------------------------------------------
@@ -63,6 +67,7 @@ def select(state: AgentState, all_tool_names: list[str]) -> dict:
 
     select_tools() returns a list of tool names ([] means none), or None for topic
     "other", which means every tool. Note: "every tool" includes the write tool.
+    Also resets `rearmed` for the new turn.
     """
 
     chosen = select_tools(TurnPlan(**state["plan"]))
@@ -70,7 +75,7 @@ def select(state: AgentState, all_tool_names: list[str]) -> dict:
         loadout = all_tool_names
     else:
         loadout = chosen
-    return {"loadout": loadout}
+    return {"loadout": loadout, "rearmed": False}
 
 
 def model_with_tools(base_model, tools_by_name: dict, names: list[str]):
@@ -95,16 +100,58 @@ def call_model(state: AgentState, base_model, tools_by_name: dict) -> dict:
     return {"messages": [response]}
 
 
+def used_tool_this_turn(messages: list) -> bool:
+    """True if any tool ran in the current turn (since the latest user message)."""
+
+    current_turn = recent_turns(messages, keep=1)
+    return any(isinstance(message, ToolMessage) for message in current_turn)
+
+
+def lookup_was_missed(state: AgentState) -> bool:
+    """True if the plan needed a lookup, none happened, and we haven't retried yet."""
+
+    plan = TurnPlan(**state["plan"])
+    return (
+        plan.requires_tools
+        and not state["rearmed"]
+        and not used_tool_this_turn(state["messages"])
+    )
+
+
 def route(state: AgentState) -> str:
     """Step 4: after the model replies, choose the next step.
 
-    - The model asked for tools  -> "tools" (step 5)
-    - It answered                -> END (the turn is over)
+    - The model asked for tools          -> "tools" (step 5a)
+    - It answered, but missed a lookup   -> "rearm" (step 5b, retry once)
+    - It answered                        -> END (the turn is over)
     """
 
     if state["messages"][-1].tool_calls:
         return "tools"
+    if lookup_was_missed(state):
+        return "rearm"
     return END
+
+
+def rearm(state: AgentState, all_tool_names: list[str]) -> dict:
+    """Step 5b (only when a lookup was missed): retry once with every read tool.
+
+    - Loadout: every read tool. The write tool stays only if it was already allowed
+      this turn, so a retry can never be what turns the write on.
+    - Deletes the answer the model just wrote without a lookup (the user never saw it).
+    - Sets `rearmed`, so route() won't send this turn here a second time.
+    """
+
+    allowed = [
+        name for name in all_tool_names
+        if name not in WRITE_TOOLS or name in state["loadout"]
+    ]
+    unseen_answer = state["messages"][-1]
+    return {
+        "loadout": allowed,
+        "rearmed": True,
+        "messages": [RemoveMessage(id=unseen_answer.id)],  # delete by id, don't append
+    }
 
 
 # WIRING ----------------------------------------------------------------------
@@ -129,16 +176,20 @@ def build_graph(tools: list):
     graph.add_node("model", partial(
         call_model, base_model=base_model, tools_by_name=tools_by_name,
     ))
-    # Step 5: LangGraph's ToolNode runs the tools the model asked for.
+    graph.add_node("rearm", partial(rearm, all_tool_names=all_tool_names))
+    # Step 5a: LangGraph's ToolNode runs the tools the model asked for.
     graph.add_node("tools", ToolNode(tools))
 
-    # START -> plan -> select -> model, then model -> tools / END, and tools goes back
-    # to model.
+    # START -> plan -> select -> model, then model -> tools / rearm / END, and tools
+    # and rearm both go back to model.
     graph.add_edge(START, "plan")
     graph.add_edge("plan", "select")
     graph.add_edge("select", "model")
-    graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
+    graph.add_conditional_edges(
+        "model", route, {"tools": "tools", "rearm": "rearm", END: END},
+    )
     graph.add_edge("tools", "model")
+    graph.add_edge("rearm", "model")
 
     # The checkpointer saves the state per conversation (thread_id) between turns, so
     # each turn starts with the messages of all earlier turns.
