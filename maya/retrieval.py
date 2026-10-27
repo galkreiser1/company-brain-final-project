@@ -6,15 +6,19 @@ Access rule: a document about one employee (subject_employee_id is set) is visib
 only to HR and to that employee. Every other document is visible to everyone.
 """
 
+from typing import Protocol
+
 from opensearchpy import OpenSearch
 
 from maya.config import MODEL_ID, OPENSEARCH_INDEX
-from maya.opensearch import bedrock, embed_text
-from maya.schemas import CallerContext
+from maya.opensearch import bedrock, embed_text, opensearch_client
+from maya.schemas import CallerContext, Evidence
 
 
 HR_GROUP = "UG_HR"
 
+# How many chunks a search returns, after reranking.
+TOP_K = 4
 # The vector search fetches this many candidates; the reranker then keeps the best few.
 CANDIDATES = 20
 # The fields each hit returns. The vector itself isn't needed after the search.
@@ -178,3 +182,59 @@ def rerank(query: str, candidates: list[dict]) -> list[tuple[dict, float]]:
     scores = read_scores(response, len(candidates))
     order = sorted(range(len(candidates)), key=lambda i: scores.get(i, 0.0), reverse=True)
     return [(candidates[i], scores.get(i, 0.0)) for i in order]
+
+
+# 4. THE RETRIEVER ------------------------------------------------------------
+
+class EvidenceRetriever(Protocol):
+    """Anything that can search the documents for a caller.
+
+    A Protocol only describes the method a retriever must have. The agent depends
+    on this, not on OpenSearch, so a test can pass in a fake retriever instead.
+    """
+
+    def search(self, query: str, caller: CallerContext, k: int = TOP_K) -> list[Evidence]:
+        ...
+
+
+def to_evidence(chunk: dict, score: float) -> Evidence:
+    """One reranked chunk as Evidence.
+
+    Gets: the chunk's fields from OpenSearch, and its reranker score.
+    Returns: the Evidence (subject_employee_id is left out: the agent doesn't need it).
+    """
+
+    return Evidence(
+        doc_id=chunk["doc_id"],
+        chunk_id=chunk["chunk_id"],
+        collection=chunk["collection"],
+        section=chunk["section"],
+        updated=chunk.get("updated"),
+        text=chunk["text"],
+        score=score,
+    )
+
+
+class OpenSearchRetriever:
+    """The real retriever: filtered k-NN search on OpenSearch, then the Nova reranker."""
+
+    def __init__(self, client: OpenSearch | None = None):
+        self.client = client or opensearch_client()
+
+    def search(self, query: str, caller: CallerContext, k: int = TOP_K) -> list[Evidence]:
+        """The `k` chunks that best answer the query, among those the caller may see.
+
+        Gets: the query, the caller (set by code, never by the model), and `k`.
+        Returns: up to `k` Evidence, best first ([] if the caller may see nothing
+        relevant).
+        """
+
+        candidates = knn_candidates(self.client, query, caller)
+        # A second check, in Python, in case the filter is ever wrong: a chunk the
+        # caller may not see never reaches the reranker or the agent.
+        allowed = [c for c in candidates if authorize(caller, c["subject_employee_id"])]
+        if not allowed:
+            return []
+
+        ranked = rerank(query, allowed)
+        return [to_evidence(chunk, score) for chunk, score in ranked[:k]]
