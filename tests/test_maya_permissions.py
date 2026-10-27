@@ -13,8 +13,8 @@ import pytest
 
 from maya.config import DATA_DIR
 from maya.ingest import document_records, load_employee_ids
-from maya.retrieval import access_filter, authorize
-from maya.schemas import CallerContext
+from maya.retrieval import access_filter, authorize, search_about
+from maya.schemas import CallerContext, Evidence
 
 
 SARA_HR = CallerContext(caller_id="E004", user_group="UG_HR")
@@ -86,3 +86,50 @@ def test_ingest_onboarding_policy_is_for_everyone():
         assert record["subject_employee_id"] is None
         assert record["audience"] == "all"
         assert record["updated"] == "2026-06-01"  # from its "Effective date:" line
+
+
+# 3. A FAKE RETRIEVER ---------------------------------------------------------
+# Stands in for OpenSearchRetriever (it fits the EvidenceRetriever Protocol), and
+# writes down every search it's asked to run.
+
+MAYA_CHUNK = Evidence(
+    doc_id="employment/maya_cohen_offer_letter.md",
+    chunk_id="employment/maya_cohen_offer_letter.md#0",
+    collection="employment",
+    section="",
+    updated=None,
+    text="Employee: Maya Cohen ...",
+    score=1.0,
+)
+
+
+class FakeRetriever:
+    """Returns one chunk about Maya for any search, and records each call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def search(self, query: str, caller: CallerContext, k: int = 4) -> list[Evidence]:
+        self.calls.append((query, caller.caller_id))
+        return [MAYA_CHUNK]
+
+
+def test_denied_caller_triggers_no_search_and_gets_nothing():
+    retriever = FakeRetriever()
+
+    evidence = search_about(retriever, "What is Maya's salary?", RACHEL, "E001")
+
+    assert evidence == []
+    assert retriever.calls == []  # the retriever was never even asked
+
+
+@pytest.mark.parametrize("caller", [SARA_HR, MAYA], ids=["hr", "herself"])
+def test_allowed_caller_searches_once(caller):
+    # The other half: proves the fake is wired up, so "zero calls" above means
+    # the search was blocked, not that the fake never runs.
+    retriever = FakeRetriever()
+
+    evidence = search_about(retriever, "What is Maya's salary?", caller, "E001")
+
+    assert evidence == [MAYA_CHUNK]
+    assert retriever.calls == [("What is Maya's salary?", caller.caller_id)]

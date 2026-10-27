@@ -238,3 +238,21 @@ class OpenSearchRetriever:
 
         ranked = rerank(query, allowed)
         return [to_evidence(chunk, score) for chunk, score in ranked[:k]]
+
+
+# 5. SEARCHING ABOUT ONE EMPLOYEE ---------------------------------------------
+
+def search_about(retriever: EvidenceRetriever, query: str, caller: CallerContext,
+                 subject_employee_id: str | None, k: int = TOP_K) -> list[Evidence]:
+    """Search, but only if the caller may see documents about this employee.
+
+    Gets: a retriever, the query, the caller, the employee the question is about
+    (None if nobody in particular), and `k`.
+    Returns: the retriever's evidence, or [] without searching at all when
+    authorize() denies the caller. Not searching means nothing about that employee
+    can leak, not even through the reranker's model call.
+    """
+
+    if not authorize(caller, subject_employee_id):
+        return []
+    return retriever.search(query, caller, k=k)
