@@ -67,10 +67,12 @@ def access_filter(caller: CallerContext) -> list[dict]:
 
 # 2. FILTERED VECTOR SEARCH ---------------------------------------------------
 
-def knn_body(vector: list[float], caller: CallerContext, n: int) -> dict:
-    """The k-NN search request, with the access filter inside the k-NN block.
+def knn_body(vector: list[float], caller: CallerContext, n: int,
+             collections: list[str] | None = None) -> dict:
+    """The k-NN search request, with the filters inside the k-NN block.
 
-    Gets: the query's vector, the caller, and how many hits to return.
+    Gets: the query's vector, the caller, how many hits to return, and optionally
+    the only collections to search.
     Returns: the request body.
 
     The filter is inside the k-NN block, so OpenSearch only considers chunks the
@@ -80,20 +82,23 @@ def knn_body(vector: list[float], caller: CallerContext, n: int) -> dict:
 
     knn = {"vector": vector, "k": n}
     clauses = access_filter(caller)
+    if collections:
+        clauses = clauses + [{"terms": {"collection": collections}}]  # any of these
     if clauses:
         knn["filter"] = {"bool": {"filter": clauses}}
     return {"size": n, "query": {"knn": {"vector": knn}}, "_source": SOURCE_FIELDS}
 
 
 def knn_candidates(client: OpenSearch, query: str, caller: CallerContext,
-                   n: int = CANDIDATES) -> list[dict]:
+                   n: int = CANDIDATES, collections: list[str] | None = None) -> list[dict]:
     """The `n` chunks closest in meaning to the query, among those the caller may see.
 
-    Gets: the OpenSearch client, the query text, the caller, and `n`.
+    Gets: the OpenSearch client, the query text, the caller, `n`, and optionally the
+    only collections to search.
     Returns: the chunks' fields (doc_id, text, ...), closest first.
     """
 
-    body = knn_body(embed_text(query), caller, n)
+    body = knn_body(embed_text(query), caller, n, collections)
     hits = client.search(index=OPENSEARCH_INDEX, body=body)["hits"]["hits"]
     return [hit["_source"] for hit in hits]
 
@@ -193,7 +198,8 @@ class EvidenceRetriever(Protocol):
     on this, not on OpenSearch, so a test can pass in a fake retriever instead.
     """
 
-    def search(self, query: str, caller: CallerContext, k: int = TOP_K) -> list[Evidence]:
+    def search(self, query: str, caller: CallerContext, k: int = TOP_K,
+               collections: list[str] | None = None) -> list[Evidence]:
         ...
 
 
@@ -221,15 +227,17 @@ class OpenSearchRetriever:
     def __init__(self, client: OpenSearch | None = None):
         self.client = client or opensearch_client()
 
-    def search(self, query: str, caller: CallerContext, k: int = TOP_K) -> list[Evidence]:
+    def search(self, query: str, caller: CallerContext, k: int = TOP_K,
+               collections: list[str] | None = None) -> list[Evidence]:
         """The `k` chunks that best answer the query, among those the caller may see.
 
-        Gets: the query, the caller (set by code, never by the model), and `k`.
+        Gets: the query, the caller (set by code, never by the model), `k`, and
+        optionally the only collections to search (None: all of them).
         Returns: up to `k` Evidence, best first ([] if the caller may see nothing
         relevant).
         """
 
-        candidates = knn_candidates(self.client, query, caller)
+        candidates = knn_candidates(self.client, query, caller, collections=collections)
         # A second check, in Python, in case the filter is ever wrong: a chunk the
         # caller may not see never reaches the reranker or the agent.
         allowed = [c for c in candidates if authorize(caller, c["subject_employee_id"])]

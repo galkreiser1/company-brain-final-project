@@ -18,30 +18,43 @@ SARA_HR = {"caller_id": "E004", "user_group": "UG_HR"}
 USER_MESSAGE = "What does her offer letter say she needs on day one?"
 
 
+def chunk(doc_id: str, collection: str) -> Evidence:
+    """A one-chunk Evidence from a document."""
+
+    return Evidence(doc_id=doc_id, chunk_id=f"{doc_id}#0", collection=collection,
+                    section="", updated=None, text="...", score=0.9)
+
+
+OFFER_LETTER = chunk("employment/maya_cohen_offer_letter.md", "employment")
+ONBOARDING_POLICY = chunk("policies/onboarding_policy.md", "policies")
+
+
 class FakeRetriever:
-    """Returns one chunk for any search, and records each call."""
+    """Records each search. Returns the offer letter, or, for a search limited to
+    some collections, `filtered` (the onboarding policy unless told otherwise)."""
 
-    def __init__(self):
+    def __init__(self, filtered: list[Evidence] | None = None):
         self.calls = []
+        self.filtered = [ONBOARDING_POLICY] if filtered is None else filtered
 
-    def search(self, query: str, caller: CallerContext, k: int = 4) -> list[Evidence]:
-        self.calls.append({"query": query, "caller": caller})
-        return [Evidence(
-            doc_id="employment/maya_cohen_offer_letter.md",
-            chunk_id="employment/maya_cohen_offer_letter.md#0",
-            collection="employment",
-            section="",
-            updated=None,
-            text="Required systems: Okta, Slack, Webex, Salesforce",
-            score=0.9,
-        )]
+    def search(self, query: str, caller: CallerContext, k: int = 4,
+               collections: list[str] | None = None) -> list[Evidence]:
+        self.calls.append({"query": query, "caller": caller, "collections": collections})
+        if collections:
+            return self.filtered
+        return [OFFER_LETTER]
 
 
-def make_state(requires_tools: bool = True, search_query: str = "Maya Cohen offer letter") -> dict:
-    """A state just after the plan step: one user message and the plan."""
+def make_state(requires_tools: bool = True, search_query: str = "Maya Cohen offer letter",
+               intent: str = "employee_lookup") -> dict:
+    """A state just after the plan step: one user message and the plan.
+
+    The default topic, employee_lookup, needs only "employment", which the offer
+    letter covers, so by default one search is enough.
+    """
 
     plan = TurnPlan(
-        current_intent="onboarding_status",
+        current_intent=intent,
         requires_tools=requires_tools,
         search_query=search_query,
     )
@@ -101,3 +114,44 @@ def test_empty_search_query_falls_back_to_the_users_message():
     retrieve(make_state(search_query=""), make_config(**SARA_HR), retriever=retriever)
 
     assert retriever.calls[0]["query"] == USER_MESSAGE
+
+
+# THE EXTRA SEARCH ------------------------------------------------------------
+# onboarding_status needs "employment" and "policies". The first search returns
+# only the offer letter (employment), so "policies" is missing.
+
+def test_missing_collection_means_exactly_two_searches():
+    retriever = FakeRetriever()
+
+    result = retrieve(make_state(intent="onboarding_status"), make_config(**SARA_HR),
+                      retriever=retriever)
+
+    assert len(retriever.calls) == 2
+    assert retriever.calls[0]["collections"] is None          # first: everything
+    assert retriever.calls[1]["collections"] == ["policies"]  # then: only what's missing
+    assert [c["chunk_id"] for c in result["evidence"]] == [
+        OFFER_LETTER.chunk_id, ONBOARDING_POLICY.chunk_id,
+    ]
+
+
+def test_never_more_than_two_searches():
+    # The extra search finds nothing in "policies" either. The step still stops.
+    retriever = FakeRetriever(filtered=[])
+
+    result = retrieve(make_state(intent="onboarding_status"), make_config(**SARA_HR),
+                      retriever=retriever)
+
+    assert len(retriever.calls) == 2
+    assert [c["chunk_id"] for c in result["evidence"]] == [OFFER_LETTER.chunk_id]
+
+
+def test_extra_search_adds_no_duplicates():
+    # The extra search returns a chunk the first search already found.
+    retriever = FakeRetriever(filtered=[OFFER_LETTER, ONBOARDING_POLICY])
+
+    result = retrieve(make_state(intent="onboarding_status"), make_config(**SARA_HR),
+                      retriever=retriever)
+
+    assert [c["chunk_id"] for c in result["evidence"]] == [
+        OFFER_LETTER.chunk_id, ONBOARDING_POLICY.chunk_id,
+    ]

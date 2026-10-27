@@ -27,7 +27,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from maya.loadout import WRITE_TOOLS, select_tools
+from maya.loadout import REQUIRED_COLLECTIONS, WRITE_TOOLS, select_tools
 from maya.memory import (
     ConversationMemory,
     distiller_messages,
@@ -38,7 +38,7 @@ from maya.memory import (
 from maya.model import get_model
 from maya.planning import TurnPlan, answer_messages, message_text, recent_turns
 from maya.retrieval import EvidenceRetriever
-from maya.schemas import CallerContext
+from maya.schemas import CallerContext, Evidence
 
 
 # STATE -----------------------------------------------------------------------
@@ -129,6 +129,20 @@ def caller_from_config(config: RunnableConfig) -> CallerContext | None:
     return CallerContext(caller_id=caller_id, user_group=user_group)
 
 
+def missing_collections(intent: str, evidence: list[Evidence]) -> list[str]:
+    """The collections this topic needs (REQUIRED_COLLECTIONS) that the evidence lacks."""
+
+    found = {chunk.collection for chunk in evidence}
+    return [name for name in REQUIRED_COLLECTIONS.get(intent, []) if name not in found]
+
+
+def merge_evidence(first: list[Evidence], extra: list[Evidence]) -> list[Evidence]:
+    """The first search's chunks, then the extra search's new ones (no duplicates)."""
+
+    seen = {chunk.chunk_id for chunk in first}
+    return first + [chunk for chunk in extra if chunk.chunk_id not in seen]
+
+
 def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetriever) -> dict:
     """Step 4: search the documents for this turn. No model call of its own.
 
@@ -136,6 +150,8 @@ def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetri
     - The plan needs no lookup: no search.
     - Otherwise: one search with the plan's search_query (or the user's message, if
       the planner left it empty).
+    - If the results lack a collection the topic needs, one more search, limited to
+      the missing collections. Never a third, even if that one finds nothing.
     Always sets `evidence`, so last turn's chunks never carry over.
 
     LangGraph passes `config` in because the function has a parameter of that name.
@@ -148,6 +164,11 @@ def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetri
 
     query = plan.search_query or message_text(state["messages"][-1])
     evidence = retriever.search(query, caller)
+
+    missing = missing_collections(plan.current_intent, evidence)
+    if missing:
+        extra = retriever.search(query, caller, collections=missing)
+        evidence = merge_evidence(evidence, extra)
     return {"evidence": [chunk.model_dump() for chunk in evidence]}
 
 

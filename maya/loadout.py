@@ -39,6 +39,20 @@ LOADOUTS: dict[str, list[str] | None] = {
     "other": None,
 }
 
+# For each topic, the document collections a good answer needs. If the first search
+# finds nothing from one of them, the retrieve step searches once more, limited to the
+# missing ones (see retrieve() in graph.py). An empty list: any collection will do.
+REQUIRED_COLLECTIONS: dict[str, list[str]] = {
+    "policy_question": ["policies"],
+    "employee_lookup": ["employment"],
+    "onboarding_status": ["employment", "policies"],
+    "equipment_request": ["policies"],
+    "subscription_review": ["contracts"],
+    "access_request": ["policies"],
+    "ticket_status": ["it_kb"],
+    "other": [],
+}
+
 # Tools that change a real system. They are never chosen by topic. They are added only
 # when the user has approved the action, so when in doubt they stay hidden ("fail
 # closed"). Read tools do the opposite: when in doubt, show them ("fail open").

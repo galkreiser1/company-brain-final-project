@@ -118,6 +118,23 @@ class ModelCallRecorder(BaseCallbackHandler):
         call["input_tokens"] = (call["reply"].usage_metadata or {}).get("input_tokens", 0)
 
 
+# RECORDING EVERY SEARCH ------------------------------------------------------
+
+class RecordingRetriever:
+    """Wraps the real retriever and records each search's collections filter.
+
+    It has the same search() method, so the graph can't tell the difference.
+    """
+
+    def __init__(self, retriever):
+        self.retriever = retriever
+        self.searches = []  # one entry per search: its collections (None: all)
+
+    def search(self, query, caller, k=4, collections=None):
+        self.searches.append(collections)
+        return self.retriever.search(query, caller, k=k, collections=collections)
+
+
 # CHECKS AGAINST THE GOLDEN DATASET -------------------------------------------
 
 def arg_check_passes(check: dict, tool_calls: list) -> bool:
@@ -197,10 +214,12 @@ def latest_turn_start(messages: list) -> int:
     )
 
 
-async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict) -> dict:
+async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
+                   retriever: RecordingRetriever) -> dict:
     """Send one user message, then collect what happened in that turn."""
 
     first_call = len(recorder.calls)
+    first_search = len(retriever.searches)
     # Where the memory ended before this turn, to tell if a distil was kept or rejected.
     before = (await graph.aget_state(config)).values.get("distilled_upto", 0)
     # Only the new message is sent. The checkpointer adds the earlier ones.
@@ -226,6 +245,7 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict)
         "distilled_upto": result.get("distilled_upto", 0),
         "distilled_upto_before": before,
         "evidence": result.get("evidence") or [],
+        "searches": retriever.searches[first_search:],
         # The messages the memory doesn't cover yet: what the next check counts.
         "fresh": messages[result.get("distilled_upto", 0):],
     }
@@ -287,6 +307,16 @@ def describe_memory(outcome: dict) -> str:
         f"{status} · since last distil: {len(fresh)}/{max_messages} messages, "
         f"~{tokens:,}/{max_tokens:,} tokens{next_turn}"
     )
+
+
+def describe_searches(searches: list) -> str:
+    """How many searches retrieve ran, like "2 searches (2nd only: policies)"."""
+
+    if not searches:
+        return "no search"
+    if len(searches) == 1:
+        return "1 search"
+    return f"2 searches (2nd only: {', '.join(searches[1])})"
 
 
 def describe_evidence(evidence: list[dict], answer: str) -> str:
@@ -384,7 +414,8 @@ def print_turn(number: int, outcome: dict) -> None:
     loadout = outcome["loadout"]
     print(f"  loadout: {', '.join(loadout) or '(no tools)'} ({len(loadout)} of {TOOL_COUNT})")
     print(f"  tools:   {tools or '(none)'}")
-    print(f"  evidence: {describe_evidence(outcome['evidence'], answer)}")
+    print(f"  evidence: {describe_searches(outcome['searches'])} · "
+          f"{describe_evidence(outcome['evidence'], answer)}")
     print(f"  checks:  {describe_checks(outcome['checks'])}")
     print(f"  cost:    {len(calls)} model calls ({per_step}) · {input_tokens:,} input tokens · "
           f"up to {most_tools} tools shown")
@@ -406,8 +437,10 @@ How to read this log:
   - retrieve searches the documents. Its reranker calls Bedrock directly, not
     through LangChain, so those calls aren't listed or counted here.
   - The answer call's system prompt ends with "DOCUMENTS FOR THIS TURN": the chunks
-    retrieve found. EVIDENCE at the end of a turn lists them (reranker score) and
-    marks the ones the answer CITED.
+    retrieve found. EVIDENCE at the end of a turn says how many searches ran (a
+    2nd one, limited to the missing collections, runs when a collection the topic
+    needs is missing), then lists the chunks (reranker score) and marks the ones
+    the answer CITED.
   - ‹ASSISTANT_PROMPT›, ‹IMPORTANT_POINTERS›, ‹PLANNER_PROMPT› and ‹DISTIL_PROMPT›
     stand for those prompts' full text (see maya/planning.py and maya/memory.py).
   - MEMORY at the end of a turn shows the saved notes, when there are any.
@@ -465,7 +498,8 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
     lines += [
         "",
         f"CHECKS   {describe_checks(outcome['checks'])}",
-        f"EVIDENCE {describe_evidence(outcome['evidence'], describe_reply(outcome['model_calls'][-1]['reply']))}",
+        f"EVIDENCE {describe_searches(outcome['searches'])} · "
+        f"{describe_evidence(outcome['evidence'], describe_reply(outcome['model_calls'][-1]['reply']))}",
         f"STATE    {outcome['saved_messages']} messages saved in thread {THREAD_ID}",
         f"MEMORY   {describe_memory(outcome)}",
     ]
@@ -478,7 +512,8 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
 
 async def main() -> None:
     tools = await load_tools()
-    graph = build_graph(tools, OpenSearchRetriever())
+    retriever = RecordingRetriever(OpenSearchRetriever())
+    graph = build_graph(tools, retriever)
     recorder = ModelCallRecorder()
     session = load_session()
     config = {
@@ -500,7 +535,7 @@ async def main() -> None:
     with LOG_FILE.open("w") as log:
         log.write(log_header(len(tools)))
         for number, turn in enumerate(turns, start=1):
-            outcome = await run_turn(graph, config, recorder, turn)
+            outcome = await run_turn(graph, config, recorder, turn, retriever)
             print_turn(number, outcome)
             log.write(log_turn(number, outcome, len(tools)))
             passed += turn_passed(outcome)
