@@ -11,3 +11,5 @@ langchain                 # chat-model interface and structured output
 langchain-aws             # ChatBedrockConverse — LangChain's wrapper over Bedrock Converse
 langgraph                 # StateGraph, checkpointer, conditional edges — every stage
 langchain-mcp-adapters    # load the MCP server's tools as LangChain tools
+opensearch-py
+pytest
