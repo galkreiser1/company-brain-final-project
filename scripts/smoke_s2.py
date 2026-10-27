@@ -25,7 +25,7 @@ from maya.config import MCP_SERVER_URL, REPO_ROOT
 import maya.memory
 from maya.graph import build_graph
 from maya.memory import DISTIL_PROMPT, PLANNER_PROMPT, estimate_tokens, render_memory
-from maya.planning import ASSISTANT_PROMPT, message_text, render_transcript
+from maya.planning import ASSISTANT_PROMPT, IMPORTANT_POINTERS, message_text, render_transcript
 from maya.retrieval import OpenSearchRetriever
 
 
@@ -46,6 +46,7 @@ RECURSION_LIMIT = 12
 # what changes from call to call stands out.
 KNOWN_PROMPTS = {
     "ASSISTANT_PROMPT": ASSISTANT_PROMPT,
+    "IMPORTANT_POINTERS": IMPORTANT_POINTERS.strip(),
     "PLANNER_PROMPT": PLANNER_PROMPT,
     "DISTIL_PROMPT": DISTIL_PROMPT,
 }
@@ -407,8 +408,8 @@ How to read this log:
   - The answer call's system prompt ends with "DOCUMENTS FOR THIS TURN": the chunks
     retrieve found. EVIDENCE at the end of a turn lists them (reranker score) and
     marks the ones the answer CITED.
-  - ‹ASSISTANT_PROMPT›, ‹PLANNER_PROMPT› and ‹DISTIL_PROMPT› stand for those
-    prompts' full text (see maya/planning.py and maya/memory.py).
+  - ‹ASSISTANT_PROMPT›, ‹IMPORTANT_POINTERS›, ‹PLANNER_PROMPT› and ‹DISTIL_PROMPT›
+    stand for those prompts' full text (see maya/planning.py and maya/memory.py).
   - MEMORY at the end of a turn shows the saved notes, when there are any.
   - Old answers and tool results are cut to {short} characters.
 """

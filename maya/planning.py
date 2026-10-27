@@ -26,6 +26,16 @@ ASSISTANT_PROMPT = (
     "- Answer in at most six sentences; no preamble."
 )
 
+# Maya's own rules, added after ASSISTANT_PROMPT (which stays word for word from
+# Lesson 10). Each rule fixes a mistake seen in the smoke test.
+IMPORTANT_POINTERS = (
+    "\n\nImportant pointers:\n"
+    # With documents about a person in the prompt, the model treated her as already
+    # looked up and passed her name where a tool needs her id (which finds nothing).
+    "- An employee id (like E001) is not the person's name. If a tool needs an "
+    "employee_id you don't have, look it up with get_employee first."
+)
+
 
 # How many recent turns the answer call receives as real messages.
 KEEP_VERBATIM_TURNS = 2
@@ -309,13 +319,15 @@ def render_evidence(evidence: list[dict]) -> str:
 def answer_messages(state: dict, plan: TurnPlan) -> list:
     """What the answer call receives: the plan, the documents, and the last two turns.
 
-    - The system prompt is ASSISTANT_PROMPT, then the plan, then this turn's
-      retrieved chunks (see render_evidence).
+    - The system prompt is ASSISTANT_PROMPT, then IMPORTANT_POINTERS, then the plan,
+      then this turn's retrieved chunks (see render_evidence).
     - Then come the last KEEP_VERBATIM_TURNS turns (see conversation_window): the
       previous turn without its tool calls, and the current turn in full.
     """
 
     evidence = state.get("evidence") or []
-    system_prompt = ASSISTANT_PROMPT + render_plan(plan) + render_evidence(evidence)
+    system_prompt = (
+        ASSISTANT_PROMPT + IMPORTANT_POINTERS + render_plan(plan) + render_evidence(evidence)
+    )
     recent = conversation_window(state["messages"], keep=KEEP_VERBATIM_TURNS)
     return [SystemMessage(system_prompt), *recent]
