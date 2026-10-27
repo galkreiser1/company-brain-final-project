@@ -280,14 +280,42 @@ def render_plan(plan: TurnPlan) -> str:
     )
 
 
-def answer_messages(state: dict, plan: TurnPlan) -> list:
-    """What the answer call receives: the plan, plus only the last two turns.
+def render_evidence(evidence: list[dict]) -> str:
+    """The retrieved document chunks as a labelled block, for the answer call.
 
-    - The system prompt is ASSISTANT_PROMPT with the plan added at the end.
+    Each chunk is labelled with its chunk_id (and section and date), so the answer can
+    cite exactly where a claim came from. No chunks: no block at all.
+    """
+
+    if not evidence:
+        return ""
+
+    chunks = []
+    for chunk in evidence:
+        section = chunk["section"] or "(top of document)"
+        updated = chunk["updated"] or "no date"
+        chunks.append(f"[{chunk['chunk_id']}] section: {section} · updated: {updated}\n"
+                      f"{chunk['text']}")
+    return (
+        "\n\n--- DOCUMENTS FOR THIS TURN ---\n"
+        "Excerpts from company documents, retrieved for this message. After each claim "
+        "you take from them, cite its chunk_id in square brackets, e.g. "
+        "[policies/expense_policy.md#2].\n\n"
+        + "\n\n".join(chunks)
+        + "\n--- END DOCUMENTS ---"
+    )
+
+
+def answer_messages(state: dict, plan: TurnPlan) -> list:
+    """What the answer call receives: the plan, the documents, and the last two turns.
+
+    - The system prompt is ASSISTANT_PROMPT, then the plan, then this turn's
+      retrieved chunks (see render_evidence).
     - Then come the last KEEP_VERBATIM_TURNS turns (see conversation_window): the
       previous turn without its tool calls, and the current turn in full.
     """
 
-    system_prompt = ASSISTANT_PROMPT + render_plan(plan)
+    evidence = state.get("evidence") or []
+    system_prompt = ASSISTANT_PROMPT + render_plan(plan) + render_evidence(evidence)
     recent = conversation_window(state["messages"], keep=KEEP_VERBATIM_TURNS)
     return [SystemMessage(system_prompt), *recent]

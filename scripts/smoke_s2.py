@@ -54,6 +54,10 @@ KNOWN_PROMPTS = {
 # "calls" it to give its reply in that shape. These are those names, not real tools.
 OUTPUT_FORMATS = {"TurnPlan", "ConversationMemory"}
 
+# Tools that return document text. The retrieve step searches the same documents, so
+# its evidence can stand in for them (see covered_by_evidence).
+DOCUMENT_TOOLS = {"search_hr_documents", "search_knowledge_base", "get_policy"}
+
 # In the log, old answers and tool results are cut to this many characters.
 SHORT = 200
 
@@ -129,10 +133,22 @@ def arg_check_passes(check: dict, tool_calls: list) -> bool:
     return False
 
 
-def check_turn(turn: dict, plan: dict, tool_calls: list, answer: str) -> list[tuple[str, bool]]:
+def covered_by_evidence(called: set, evidence: list, rearmed: bool) -> bool:
+    """True if the evidence stood in for a document tool.
+
+    Only when: the turn has evidence, rearm offered every tool, and the model still
+    called none. So it judged the documents enough, even with a second chance.
+    """
+
+    return bool(evidence) and rearmed and not called
+
+
+def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[tuple[str, bool]]:
     """Grade one turn against the golden dataset. Returns (label, passed) pairs."""
 
+    plan = result["plan"]
     called = {call["name"] for call in tool_calls}
+    by_evidence = covered_by_evidence(called, result.get("evidence"), result.get("rearmed"))
     checks = []
 
     # "a|b" in the dataset means either intent is accepted.
@@ -142,9 +158,15 @@ def check_turn(turn: dict, plan: dict, tool_calls: list, answer: str) -> list[tu
     checks.append((label, intent in accepted))
 
     wants_tools = turn["should_use_tools"]
-    checks.append(("tools used" if wants_tools else "no tools", bool(called) == wants_tools))
+    if wants_tools and by_evidence:
+        checks.append(("tools used (evidence instead, even after rearm)", True))
+    else:
+        checks.append(("tools used" if wants_tools else "no tools", bool(called) == wants_tools))
 
-    missing = [name for name in turn.get("expected_tools", []) if name not in called]
+    missing = [
+        name for name in turn.get("expected_tools", [])
+        if name not in called and not (by_evidence and name in DOCUMENT_TOOLS)
+    ]
     label = f"expected tools (missing {', '.join(missing)})" if missing else "expected tools"
     checks.append((label, not missing))
 
@@ -196,7 +218,7 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict)
         "plan": result["plan"],
         "loadout": result["loadout"],
         "tool_calls": tool_calls,
-        "checks": check_turn(turn, result["plan"], tool_calls, answer),
+        "checks": check_turn(turn, result, tool_calls, answer),
         "model_calls": recorder.calls[first_call:],
         "saved_messages": len(messages),
         "memory": result.get("memory") or {},
@@ -266,13 +288,21 @@ def describe_memory(outcome: dict) -> str:
     )
 
 
-def describe_evidence(evidence: list[dict]) -> str:
-    """The retrieved chunks on one line, like "3 chunks: policies/x.md#2 (0.9), ..."."""
+def describe_evidence(evidence: list[dict], answer: str) -> str:
+    """The retrieved chunks on one line, with how many the answer cites.
+
+    Like "3 chunks, 1 cited: policies/x.md#2 (0.9) CITED, ...". The number is the
+    reranker's score.
+    """
 
     if not evidence:
         return "(none)"
-    chunks = ", ".join(f"{chunk['chunk_id']} ({chunk['score']:.1f})" for chunk in evidence)
-    return f"{len(evidence)} chunks: {chunks}"
+    chunks, cited = [], 0
+    for chunk in evidence:
+        is_cited = chunk["chunk_id"] in answer
+        cited += is_cited
+        chunks.append(f"{chunk['chunk_id']} ({chunk['score']:.1f})" + (" CITED" if is_cited else ""))
+    return f"{len(evidence)} chunks, {cited} cited: {', '.join(chunks)}"
 
 
 def turn_passed(outcome: dict) -> bool:
@@ -353,7 +383,7 @@ def print_turn(number: int, outcome: dict) -> None:
     loadout = outcome["loadout"]
     print(f"  loadout: {', '.join(loadout) or '(no tools)'} ({len(loadout)} of {TOOL_COUNT})")
     print(f"  tools:   {tools or '(none)'}")
-    print(f"  evidence: {describe_evidence(outcome['evidence'])}")
+    print(f"  evidence: {describe_evidence(outcome['evidence'], answer)}")
     print(f"  checks:  {describe_checks(outcome['checks'])}")
     print(f"  cost:    {len(calls)} model calls ({per_step}) · {input_tokens:,} input tokens · "
           f"up to {most_tools} tools shown")
@@ -374,7 +404,9 @@ How to read this log:
     resets them with plain code, so they make no model call.)
   - retrieve searches the documents. Its reranker calls Bedrock directly, not
     through LangChain, so those calls aren't listed or counted here.
-  - EVIDENCE at the end of a turn lists the chunks retrieve found (reranker score).
+  - The answer call's system prompt ends with "DOCUMENTS FOR THIS TURN": the chunks
+    retrieve found. EVIDENCE at the end of a turn lists them (reranker score) and
+    marks the ones the answer CITED.
   - ‹ASSISTANT_PROMPT›, ‹PLANNER_PROMPT› and ‹DISTIL_PROMPT› stand for those
     prompts' full text (see maya/planning.py and maya/memory.py).
   - MEMORY at the end of a turn shows the saved notes, when there are any.
@@ -432,7 +464,7 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
     lines += [
         "",
         f"CHECKS   {describe_checks(outcome['checks'])}",
-        f"EVIDENCE {describe_evidence(outcome['evidence'])}",
+        f"EVIDENCE {describe_evidence(outcome['evidence'], describe_reply(outcome['model_calls'][-1]['reply']))}",
         f"STATE    {outcome['saved_messages']} messages saved in thread {THREAD_ID}",
         f"MEMORY   {describe_memory(outcome)}",
     ]
