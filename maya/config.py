@@ -22,3 +22,11 @@ DATA_DIR = REPO_ROOT / os.environ.get("NOVAOPS_DATA_DIR", "data/novaops")
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://127.0.0.1:9877/mcp")
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.amazon.nova-2-lite-v1:0")
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# Document search: the OpenSearch Serverless collection (found by name) and the index
+# inside it, plus the model that turns text into vectors.
+OPENSEARCH_COLLECTION = os.environ.get("OPENSEARCH_COLLECTION")
+OPENSEARCH_INDEX = os.environ.get("OPENSEARCH_INDEX", "novaops-maya")
+EMBEDDING_MODEL_ID = os.environ.get(
+    "BEDROCK_EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v2:0"
+)
