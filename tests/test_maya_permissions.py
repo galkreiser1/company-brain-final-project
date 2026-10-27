@@ -11,6 +11,8 @@ Three callers:
 
 import pytest
 
+from maya.config import DATA_DIR
+from maya.ingest import document_records, load_employee_ids
 from maya.retrieval import access_filter, authorize
 from maya.schemas import CallerContext
 
@@ -52,3 +54,35 @@ def test_access_filter_regular_sees_shared_docs_and_their_own(caller):
             "minimum_should_match": 1,
         }
     }]
+
+
+# 2. INGEST METADATA ----------------------------------------------------------
+# Built from the real files on disk; no network.
+
+DOCUMENTS_DIR = DATA_DIR / "documents"
+
+
+def records_for(doc_id: str) -> list[dict]:
+    """Every chunk record of one document, as the ingest builds them."""
+
+    employee_ids = load_employee_ids(DATA_DIR)
+    return document_records(DOCUMENTS_DIR / doc_id, DOCUMENTS_DIR, employee_ids)
+
+
+def test_ingest_maya_offer_letter_is_about_maya():
+    records = records_for("employment/maya_cohen_offer_letter.md")
+
+    assert records  # the file was split into at least one chunk
+    for record in records:  # every chunk carries the document's subject, not just the first
+        assert record["subject_employee_id"] == "E001"
+        assert record["audience"] == "hr_or_subject"
+
+
+def test_ingest_onboarding_policy_is_for_everyone():
+    records = records_for("policies/onboarding_policy.md")
+
+    assert records
+    for record in records:
+        assert record["subject_employee_id"] is None
+        assert record["audience"] == "all"
+        assert record["updated"] == "2026-06-01"  # from its "Effective date:" line
