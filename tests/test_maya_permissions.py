@@ -12,8 +12,10 @@ Three callers:
 import pytest
 
 from maya.config import DATA_DIR
-from maya.ingest import document_records, load_employee_ids
-from maya.retrieval import access_filter, authorize, search_about
+from maya.ingest import document_records, load_employee_ids, read_records
+from maya.retrieval import (
+    OpenSearchRetriever, access_filter, authorize, knn_candidates, search_about,
+)
 from maya.schemas import CallerContext, Evidence
 
 
@@ -133,3 +135,54 @@ def test_allowed_caller_searches_once(caller):
 
     assert evidence == [MAYA_CHUNK]
     assert retriever.calls == [("What is Maya's salary?", caller.caller_id)]
+
+
+# 4. INTEGRATION: THE REAL INDEX ----------------------------------------------
+# Calls OpenSearch and Bedrock, so these are skipped unless run with -m integration.
+
+MAYA_QUERIES = [
+    "What is in Maya Cohen's offer letter?",
+    "When does Maya Cohen start, and who is her manager?",
+    "What equipment and systems does Maya Cohen get for onboarding?",
+]
+
+
+@pytest.fixture(scope="module")
+def retriever():
+    """One real retriever (one OpenSearch connection) for all the tests below."""
+
+    return OpenSearchRetriever()
+
+
+@pytest.fixture(scope="module")
+def maya_doc_ids():
+    """The documents about Maya (subject E001), taken from the ingest's own records.
+
+    Evidence doesn't carry subject_employee_id, so a chunk is recognised as Maya's
+    by its doc_id.
+    """
+
+    records, _ = read_records(DATA_DIR)
+    return {r["doc_id"] for r in records if r["subject_employee_id"] == "E001"}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("query", MAYA_QUERIES)
+def test_unrelated_caller_never_gets_mayas_chunks(retriever, maya_doc_ids, query):
+    # The OpenSearch filter on its own: none of the 20 candidates is about Maya.
+    # (Checked separately, because search() would also hide a broken filter.)
+    candidates = knn_candidates(retriever.client, query, RACHEL)
+    assert all(c["subject_employee_id"] != "E001" for c in candidates)
+
+    # The full search: filter, Python check, reranker.
+    evidence = retriever.search(query, RACHEL)
+    assert evidence  # she still gets an answer from the shared documents
+    assert not {e.doc_id for e in evidence} & maya_doc_ids
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("caller", [SARA_HR, MAYA], ids=["hr", "herself"])
+@pytest.mark.parametrize("query", MAYA_QUERIES)
+def test_allowed_caller_gets_mayas_chunks(retriever, maya_doc_ids, caller, query):
+    evidence = retriever.search(query, caller)
+    assert {e.doc_id for e in evidence} & maya_doc_ids
