@@ -1,4 +1,4 @@
-"""OpenSearch and embeddings: connect to the collection, and turn text into vectors.
+"""OpenSearch and embeddings: connect, turn text into vectors, and create the index.
 
 Based on Lesson 7's homework (client.py). One client of each kind per process, so
 these are plain functions, not a class.
@@ -9,7 +9,9 @@ import json
 import boto3
 from opensearchpy import AWSV4SignerAuth, OpenSearch, RequestsHttpConnection
 
-from maya.config import EMBEDDING_MODEL_ID, OPENSEARCH_COLLECTION, REGION
+from maya.config import (
+    EMBEDDING_MODEL_ID, OPENSEARCH_COLLECTION, OPENSEARCH_INDEX, REGION,
+)
 
 
 EMBED_DIM = 1024  # Titan V2 vector width
@@ -80,3 +82,46 @@ def opensearch_client() -> OpenSearch:
         max_retries=3,
         retry_on_timeout=True,
     )
+
+
+# THE INDEX -------------------------------------------------------------------
+#
+# The mapping says what type each field has. "keyword" fields match exactly, which
+# makes them cheap to filter on (e.g. audience = "all"). "text" fields are split into
+# words for keyword search. "date" fields allow ranges (e.g. updated after June).
+
+INDEX_BODY = {
+    "settings": {"index": {"knn": True}},  # knn: allow vector search on this index
+    "mappings": {
+        "properties": {
+            "vector": {
+                "type": "knn_vector",
+                "dimension": EMBED_DIM,
+                # Titan vectors have length 1, so inner product ranks the same as
+                # cosine similarity, and is cheaper to compute.
+                "method": {"name": "hnsw", "space_type": "innerproduct"},
+            },
+            "text": {"type": "text"},
+            "doc_id": {"type": "keyword"},
+            "chunk_id": {"type": "keyword"},
+            "collection": {"type": "keyword"},
+            "section": {"type": "keyword"},
+            "subject_employee_id": {"type": "keyword"},
+            "audience": {"type": "keyword"},
+            "updated": {"type": "date", "format": "yyyy-MM-dd"},
+        }
+    },
+}
+
+
+def create_index(client: OpenSearch) -> bool:
+    """Create the Maya index if it doesn't exist yet. Returns True if it was created.
+
+    An existing index is kept as it is: re-running the ingest overwrites its chunks
+    instead of starting from an empty index.
+    """
+
+    if client.indices.exists(index=OPENSEARCH_INDEX):
+        return False
+    client.indices.create(index=OPENSEARCH_INDEX, body=INDEX_BODY)
+    return True
