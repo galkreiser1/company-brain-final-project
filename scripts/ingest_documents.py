@@ -7,10 +7,11 @@ Run order:
   2. index - create the index, if it doesn't exist yet.
   3. embed - add a vector to each record (one Bedrock call per chunk).
   4. load  - upload all records in one bulk request.
-  5. check - wait until the chunks are searchable, then count them per collection.
+  5. clean - delete chunks this run didn't load (removed sections or files).
+  6. check - wait until the chunks are searchable, then count them per collection.
 
 Safe to re-run: each chunk is stored under its chunk_id, so loading it again replaces
-it instead of adding a copy.
+it instead of adding a copy, and step 5 removes chunks that no longer exist.
 """
 
 import time
@@ -61,10 +62,44 @@ def bulk_actions(records: list[dict]) -> list[dict]:
     ]
 
 
-# 5. CHECK --------------------------------------------------------------------
+# 5. CLEAN --------------------------------------------------------------------
+
+def indexed_chunk_ids(client) -> set[str]:
+    """The _id of every chunk in the index.
+
+    One search returns at most 10,000 hits, plenty for our ~270 chunks.
+    """
+
+    response = client.search(index=OPENSEARCH_INDEX, body={
+        "size": 10_000,
+        "_source": False,  # only the ids, not the text and vectors
+        "query": {"match_all": {}},
+    })
+    return {hit["_id"] for hit in response["hits"]["hits"]}
+
+
+def delete_stale_chunks(client, records: list[dict]) -> list[str]:
+    """Delete every chunk in the index that this run didn't load. Returns their ids.
+
+    A chunk goes stale when its section or file was removed, or its document was
+    skipped this run. Only call this after the load succeeded: after a failed load,
+    good chunks would look stale too.
+    """
+
+    loaded_ids = {record["chunk_id"] for record in records}
+    stale_ids = sorted(indexed_chunk_ids(client) - loaded_ids)
+    actions = [
+        {"_op_type": "delete", "_index": OPENSEARCH_INDEX, "_id": chunk_id}
+        for chunk_id in stale_ids
+    ]
+    helpers.bulk(client, actions)
+    return stale_ids
+
+
+# 6. CHECK --------------------------------------------------------------------
 
 def wait_until_searchable(client, expected: int, timeout: int = 60) -> bool:
-    """Wait until a search sees at least `expected` chunks. False if it times out.
+    """Wait until a search sees exactly `expected` chunks. False if it times out.
 
     Serverless has no manual "refresh": new documents show up in searches a few
     seconds after loading, so we ask for the count every 2 seconds.
@@ -72,7 +107,7 @@ def wait_until_searchable(client, expected: int, timeout: int = 60) -> bool:
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if client.count(index=OPENSEARCH_INDEX)["count"] >= expected:
+        if client.count(index=OPENSEARCH_INDEX)["count"] == expected:
             return True
         time.sleep(2)
     return False
@@ -111,11 +146,18 @@ def main() -> None:
     print("Embedding...")
     embed_records(records)
 
+    # bulk() raises an error if any chunk fails to load, so a failed load stops here,
+    # before the cleanup below.
     loaded, _ = helpers.bulk(client, bulk_actions(records))
     print(f"Loaded {loaded} chunks into '{OPENSEARCH_INDEX}'.")
 
+    stale_ids = delete_stale_chunks(client, records)
+    print(f"Deleted {len(stale_ids)} stale chunks.")
+    for chunk_id in stale_ids:
+        print(f"  deleted {chunk_id}")
+
     if not wait_until_searchable(client, len(records)):
-        print("  (not all chunks are searchable yet; the counts below may be low)")
+        print("  (the index isn't up to date yet; the counts below may be off)")
     print_counts(records, indexed_per_collection(client))
 
 
