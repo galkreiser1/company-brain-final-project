@@ -8,3 +8,9 @@ packages = ["maya"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Integration tests call AWS (OpenSearch and Bedrock), so a plain `pytest` skips them.
+# Run them with `pytest -m integration` (a -m on the command line replaces this one).
+addopts = "-m 'not integration'"
+markers = [
+    "integration: calls the real novaops-maya index and Bedrock (run with -m integration)",
+]
