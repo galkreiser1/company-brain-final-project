@@ -26,6 +26,7 @@ import maya.memory
 from maya.graph import build_graph
 from maya.memory import DISTIL_PROMPT, PLANNER_PROMPT, estimate_tokens, render_memory
 from maya.planning import ASSISTANT_PROMPT, message_text, render_transcript
+from maya.retrieval import OpenSearchRetriever
 
 
 GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"
@@ -71,12 +72,11 @@ async def load_tools() -> list:
     return await client.get_tools()
 
 
-def load_turns() -> list[dict]:
-    """The first turns of session S2: each user message, plus what a good answer needs."""
+def load_session() -> dict:
+    """Session S2: who is asking (caller_id, caller_group), and its turns."""
 
     sessions = json.loads(GOLDEN_DATASETS.read_text())["sessions"]
-    session = next(s for s in sessions if s["id"] == SESSION_ID)
-    return session["turns"][:TURNS_TO_RUN]
+    return next(s for s in sessions if s["id"] == SESSION_ID)
 
 
 # RECORDING EVERY MODEL CALL --------------------------------------------------
@@ -202,6 +202,7 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict)
         "memory": result.get("memory") or {},
         "distilled_upto": result.get("distilled_upto", 0),
         "distilled_upto_before": before,
+        "evidence": result.get("evidence") or [],
         # The messages the memory doesn't cover yet: what the next check counts.
         "fresh": messages[result.get("distilled_upto", 0):],
     }
@@ -263,6 +264,15 @@ def describe_memory(outcome: dict) -> str:
         f"{status} · since last distil: {len(fresh)}/{max_messages} messages, "
         f"~{tokens:,}/{max_tokens:,} tokens{next_turn}"
     )
+
+
+def describe_evidence(evidence: list[dict]) -> str:
+    """The retrieved chunks on one line, like "3 chunks: policies/x.md#2 (0.9), ..."."""
+
+    if not evidence:
+        return "(none)"
+    chunks = ", ".join(f"{chunk['chunk_id']} ({chunk['score']:.1f})" for chunk in evidence)
+    return f"{len(evidence)} chunks: {chunks}"
 
 
 def turn_passed(outcome: dict) -> bool:
@@ -343,6 +353,7 @@ def print_turn(number: int, outcome: dict) -> None:
     loadout = outcome["loadout"]
     print(f"  loadout: {', '.join(loadout) or '(no tools)'} ({len(loadout)} of {TOOL_COUNT})")
     print(f"  tools:   {tools or '(none)'}")
+    print(f"  evidence: {describe_evidence(outcome['evidence'])}")
     print(f"  checks:  {describe_checks(outcome['checks'])}")
     print(f"  cost:    {len(calls)} model calls ({per_step}) · {input_tokens:,} input tokens · "
           f"up to {most_tools} tools shown")
@@ -361,6 +372,9 @@ How to read this log:
   - step: distil is the distiller (only on turns that distil); step: plan is the
     planner; step: model is the answer model. (select picks the tools and rearm
     resets them with plain code, so they make no model call.)
+  - retrieve searches the documents. Its reranker calls Bedrock directly, not
+    through LangChain, so those calls aren't listed or counted here.
+  - EVIDENCE at the end of a turn lists the chunks retrieve found (reranker score).
   - ‹ASSISTANT_PROMPT›, ‹PLANNER_PROMPT› and ‹DISTIL_PROMPT› stand for those
     prompts' full text (see maya/planning.py and maya/memory.py).
   - MEMORY at the end of a turn shows the saved notes, when there are any.
@@ -417,9 +431,10 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
 
     lines += [
         "",
-        f"CHECKS  {describe_checks(outcome['checks'])}",
-        f"STATE   {outcome['saved_messages']} messages saved in thread {THREAD_ID}",
-        f"MEMORY  {describe_memory(outcome)}",
+        f"CHECKS   {describe_checks(outcome['checks'])}",
+        f"EVIDENCE {describe_evidence(outcome['evidence'])}",
+        f"STATE    {outcome['saved_messages']} messages saved in thread {THREAD_ID}",
+        f"MEMORY   {describe_memory(outcome)}",
     ]
     if outcome["memory"]:
         lines.append(indent(render_memory(outcome["memory"]), 2))
@@ -430,15 +445,22 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
 
 async def main() -> None:
     tools = await load_tools()
-    graph = build_graph(tools)
+    graph = build_graph(tools, OpenSearchRetriever())
     recorder = ModelCallRecorder()
+    session = load_session()
     config = {
-        "configurable": {"thread_id": THREAD_ID},
+        # The caller is set here, by code: the retrieve step searches as this person.
+        "configurable": {
+            "thread_id": THREAD_ID,
+            "caller_id": session["caller_id"],
+            "user_group": session["caller_group"],
+        },
         "recursion_limit": RECURSION_LIMIT,
         "callbacks": [recorder],
     }
-    turns = load_turns()
-    print(f"Smoke test: {SESSION_ID}, turns 1-{len(turns)} · {len(tools)} tools from MCP")
+    turns = session["turns"][:TURNS_TO_RUN]
+    print(f"Smoke test: {SESSION_ID}, turns 1-{len(turns)} · {len(tools)} tools from MCP · "
+          f"caller {session['caller_id']} ({session['caller_group']})")
 
     LOG_FILE.parent.mkdir(exist_ok=True)
     passed = 0

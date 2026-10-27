@@ -68,6 +68,7 @@ INTENT_GLOSS = (
 
 # The docstring is sent to the planner as the schema's description, so it is kept word
 # for word from Lesson 10's stage 3 (whose TurnPlan is stage 2's with this docstring).
+# search_query is new here (not in Lesson 10): it feeds the retrieve step.
 class TurnPlan(BaseModel):
     """Unchanged from stage 02 — what THIS turn needs."""
 
@@ -92,6 +93,14 @@ class TurnPlan(BaseModel):
             "True only if THIS message authorises creating or filing a record in a "
             "system ('go ahead', 'file it'). Writing, drafting, summarising or "
             "'write it up' is composing text, NOT authorisation to file anything."
+        ),
+    )
+    search_query: str = Field(
+        default="",
+        description=(
+            "A standalone search query for the company documents, with names and "
+            "pronouns resolved from the conversation, e.g. 'Maya Cohen offer letter "
+            "day-one systems'. Empty if no documents are needed."
         ),
     )
 
