@@ -1,5 +1,6 @@
 """Typed records shared across the agent."""
 
+import hashlib
 from typing import Literal
 
 from pydantic import BaseModel, computed_field, model_validator
@@ -109,3 +110,32 @@ class MayaReply(BaseModel):
     answer: str  # the text the user reads
     citations: list[EvidenceCitation] = []
     checklist: OnboardingChecklist | None = None  # only for onboarding questions
+
+
+# THE WEBEX HANDOFF -------------------------------------------------------------
+# Not used until Milestone 4.
+
+class WebexHandoff(BaseModel):
+    """A blocked licence passed on to a person to sort out, e.g. Webex for E001."""
+
+    employee_id: str        # e.g. "E001"
+    software: str           # e.g. "Webex"
+    caller: CallerContext   # who asked, e.g. E004 (Sara, HR)
+    reason: str             # e.g. "42 seats in use, contract limit 40"
+    thread_id: str          # the conversation it came from
+    idempotency_key: str    # from make_idempotency_key(); see below
+
+
+def make_idempotency_key(thread_id: str, employee_id: str, software: str) -> str:
+    """A short key that's always the same for the same request.
+
+    Gets: the conversation, the employee and the software.
+    Returns: the first 16 hex characters of a sha256 of the three, joined.
+
+    "Idempotent" means doing it twice has the same effect as once: if the same
+    handoff is sent again (a retry, or the user asking twice), its key matches
+    the first one, so the receiver can spot the repeat and ignore it.
+    """
+
+    joined = "|".join([thread_id, employee_id, software])
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
