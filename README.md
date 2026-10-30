@@ -16,6 +16,34 @@ Lesson 10's finished agent (stage 3) on the 12-turn S2 conversation, compared wi
 
 Model answers vary between runs, so a rerun gives slightly different numbers.
 
+## Who may see what
+
+**Documents** (Milestone 2, the retrieval pattern from Lesson 7's homework). A document about one employee (an offer letter, an approval profile) is visible only to HR (`UG_HR`) and to that employee. Every other document is visible to everyone.
+
+- The rule is a filter inside the OpenSearch k-NN query, so a chunk the caller may not see is never even a candidate. A second check in Python drops anything the filter missed (`maya/retrieval.py`).
+- Being someone's manager gives no access. Yael Romano (E018) manages Maya Cohen (E001) but is not in HR, so she can't see Maya's employment files.
+
+**Questions about a person** (the `authorize` step, which runs right after the plan):
+
+| Case | Result |
+| --- | --- |
+| No caller in the run's settings | deny |
+| Caller is in HR | allow |
+| The message names nobody | allow (the document filter still applies) |
+| The message is about the caller | allow |
+| A name that matches no employee, and the caller isn't HR | deny |
+| Anyone else | deny |
+
+A denied turn ends with a fixed refusal before any search, tool or model call. That is the only way to leak nothing, since the MCP tools don't check who is asking.
+
+## Every turn returns a checked `MayaReply`
+
+The last step, `respond`, turns the answer into a `MayaReply`: the answer, its citations, and on onboarding turns a checklist (`maya/schemas.py`).
+
+- The model proposes citations; code keeps only those pointing at a chunk or record this conversation has actually seen (`maya/respond.py`).
+- A checklist item left with no real citation becomes `unresolved`.
+- This call uses Nova Pro. Nova 2 Lite wrote broken JSON for the nested reply (0 valid out of 8 tries); Nova Pro wrote it 4 out of 4.
+
 ## Tools: database reads only
 
 Maya loads 5 of the MCP server's 10 tools: `get_employee`, `list_onboarding_tasks`, `check_asset_inventory`, `check_software_subscription` and `list_employee_tickets` (an allowlist in `maya/loadout.py`).
