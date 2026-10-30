@@ -12,6 +12,7 @@ from opensearchpy import OpenSearch
 
 from maya.config import MODEL_ID, OPENSEARCH_INDEX
 from maya.opensearch import bedrock, embed_text, opensearch_client
+from maya.planning import ContextPlan
 from maya.schemas import CallerContext, Evidence
 
 
@@ -42,6 +43,26 @@ def authorize(caller: CallerContext, subject_employee_id: str | None) -> bool:
     if caller.user_group == HR_GROUP:
         return True
     return caller.caller_id == subject_employee_id
+
+
+def authorize_turn(caller: CallerContext | None, plan: ContextPlan) -> bool:
+    """May this caller ask about the employee this message is about?
+
+    Gets: the caller (None if the run didn't set one), and the turn's plan.
+    Returns: False (deny) if there's no caller, or the message names someone the caller
+    may not ask about, including a name that matches no employee (unless the caller is
+    in HR). True otherwise. With no subject, the search's own filter still applies.
+    """
+
+    if caller is None:
+        return False  # fail closed: nobody to check
+    if caller.user_group == HR_GROUP:
+        return True
+    if not plan.subject_name:
+        return True
+    if plan.subject_employee_id is None:
+        return False  # fail closed: a name we can't match could be anyone
+    return authorize(caller, plan.subject_employee_id)
 
 
 def access_filter(caller: CallerContext) -> list[dict]:

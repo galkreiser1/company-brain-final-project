@@ -3,17 +3,20 @@
 Each turn runs these steps:
   1. check  - is it time to distil? (enough new messages since the last time)
   2. distil - (only when step 1 says yes) turn the new messages into updated memory.
-  3. plan     - the planner reads the memory + newer messages, and writes the plan;
-                code adds the subject's id and the collections to search.
-  4. retrieve - plain code searches the plan's collections with its search_query, as
-                the caller (who is set by code, never by a model).
-  5. select   - plain code picks the turn's loadout (the tools the model may see).
-  6. model    - the answer call: the plan + the last two turns, with only the
-                loadout's tools attached.
-  7. route    - after the model replies, decide what happens next (8a, 8b, or end).
-  8a. tools   - (when the model asked for tools) run them, then back to step 6.
-  8b. rearm   - (when needed records weren't looked up) delete that answer, and retry
-                step 6 once with every read tool.
+  3. plan      - the planner reads the memory + newer messages, and writes the plan;
+                 code adds the subject's id and the collections to search.
+  4. authorize - may the caller ask about this subject? If not, go to "deny".
+  4x. deny     - (when step 4 says no) a fixed refusal, and the turn ends. No model,
+                 tool or search runs.
+  5. retrieve  - plain code searches the plan's collections with its search_query, as
+                 the caller (who is set by code, never by a model).
+  6. select    - plain code picks the turn's loadout (the tools the model may see).
+  7. model     - the answer call: the plan + the last two turns, with only the
+                 loadout's tools attached.
+  8. route     - after the model replies, decide what happens next (9a, 9b, or end).
+  9a. tools    - (when the model asked for tools) run them, then back to step 7.
+  9b. rearm    - (when needed records weren't looked up) delete that answer, and retry
+                 step 7 once with every read tool.
 
 Read in this order: AgentState, then the steps, then build_graph at the bottom.
 """
@@ -21,7 +24,7 @@ Read in this order: AgentState, then the steps, then build_graph at the bottom.
 from functools import partial
 from typing import Annotated, TypedDict
 
-from langchain_core.messages import RemoveMessage, ToolMessage
+from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -47,7 +50,7 @@ from maya.planning import (
     message_text,
     recent_turns,
 )
-from maya.retrieval import EvidenceRetriever
+from maya.retrieval import EvidenceRetriever, authorize_turn
 from maya.schemas import CallerContext, Evidence
 
 
@@ -142,6 +145,34 @@ def caller_from_config(config: RunnableConfig) -> CallerContext | None:
     return CallerContext(caller_id=caller_id, user_group=user_group)
 
 
+# The deny path's whole answer. Fixed text, so it can't reveal anything about anyone.
+REFUSAL = "I can't share another employee's onboarding information."
+
+
+def authorize_or_deny(state: AgentState, config: RunnableConfig) -> str:
+    """Step 4: may this caller ask about the employee the message is about?
+
+    Returns "retrieve" (go on) or "deny" (see authorize_turn in retrieval.py). It runs
+    before any search, tool or answer call: the MCP tools don't check who is asking,
+    so stopping the whole turn is the only way to leak nothing.
+    """
+
+    plan = ContextPlan(**state["plan"])
+    if authorize_turn(caller_from_config(config), plan):
+        return "retrieve"
+    return "deny"
+
+
+def deny(state: AgentState) -> dict:
+    """Step 4x (only when step 4 says no): reply with the fixed refusal. No model call.
+
+    Also clears the turn's evidence and loadout, so nothing from the last turn is left
+    looking like this turn's.
+    """
+
+    return {"messages": [AIMessage(REFUSAL)], "evidence": [], "loadout": [], "rearmed": False}
+
+
 def missing_collections(required: list[str], evidence: list[Evidence]) -> list[str]:
     """The required collections (the plan's required_evidence) the evidence lacks."""
 
@@ -157,7 +188,7 @@ def merge_evidence(first: list[Evidence], extra: list[Evidence]) -> list[Evidenc
 
 
 def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetriever) -> dict:
-    """Step 4: search the documents for this turn. No model call of its own.
+    """Step 5: search the documents for this turn. No model call of its own.
 
     - Unknown caller: no evidence ("fail closed": no search beats a search as nobody).
     - The plan requires no collections (no documents needed, or topic "other"): no
@@ -187,7 +218,7 @@ def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetri
 
 
 def select(state: AgentState, all_tool_names: list[str]) -> dict:
-    """Step 5: turn the plan into this turn's loadout. No model call.
+    """Step 6: turn the plan into this turn's loadout. No model call.
 
     select_tools() returns a list of tool names ([] means none), or None for topic
     "other", which means every tool. Note: "every tool" includes the write tool.
@@ -212,7 +243,7 @@ def model_with_tools(base_model, tools_by_name: dict, names: list[str]):
 
 
 def call_model(state: AgentState, base_model, tools_by_name: dict) -> dict:
-    """Step 6: ask the model for an answer, with only the loadout's tools.
+    """Step 7: ask the model for an answer, with only the loadout's tools.
 
     It gets the plan plus the last two turns (answer_messages in planning.py).
     Returns the model's reply, which may be an answer or a request to call tools.
@@ -246,10 +277,10 @@ def lookup_was_missed(state: AgentState) -> bool:
 
 
 def route(state: AgentState) -> str:
-    """Step 7: after the model replies, choose the next step.
+    """Step 8: after the model replies, choose the next step.
 
-    - The model asked for tools          -> "tools" (step 8a)
-    - It answered, but missed a lookup   -> "rearm" (step 8b, retry once)
+    - The model asked for tools          -> "tools" (step 9a)
+    - It answered, but missed a lookup   -> "rearm" (step 9b, retry once)
     - It answered                        -> END (the turn is over)
     """
 
@@ -261,7 +292,7 @@ def route(state: AgentState) -> str:
 
 
 def rearm(state: AgentState, all_tool_names: list[str]) -> dict:
-    """Step 8b (only when a lookup was missed): retry once with every read tool.
+    """Step 9b (only when a lookup was missed): retry once with every read tool.
 
     - Loadout: every read tool. The write tool stays only if it was already allowed
       this turn, so a retry can never be what turns the write on.
@@ -305,23 +336,27 @@ def build_graph(tools: list, retriever: EvidenceRetriever):
     graph = StateGraph(AgentState)
     graph.add_node("distil", partial(distil, distiller=distiller))
     graph.add_node("plan", partial(plan_turn, planner=planner, employee_ids=employee_ids))
+    graph.add_node("deny", deny)
     graph.add_node("retrieve", partial(retrieve, retriever=retriever))
     graph.add_node("select", partial(select, all_tool_names=all_tool_names))
     graph.add_node("model", partial(
         call_model, base_model=base_model, tools_by_name=tools_by_name,
     ))
     graph.add_node("rearm", partial(rearm, all_tool_names=all_tool_names))
-    # Step 8a: LangGraph's ToolNode runs the tools the model asked for.
+    # Step 9a: LangGraph's ToolNode runs the tools the model asked for.
     graph.add_node("tools", ToolNode(tools))
 
-    # START -> (distil) -> plan -> retrieve -> select -> model, then
-    # model -> tools / rearm / END,
-    # and tools and rearm both go back to model.
+    # START -> (distil) -> plan -> (authorize) -> retrieve -> select -> model, then
+    # model -> tools / rearm / END, and tools and rearm both go back to model.
+    # A denied turn goes plan -> deny -> END instead.
     graph.add_conditional_edges(
         START, distil_or_plan, {"distil": "distil", "plan": "plan"},
     )
     graph.add_edge("distil", "plan")
-    graph.add_edge("plan", "retrieve")
+    graph.add_conditional_edges(
+        "plan", authorize_or_deny, {"retrieve": "retrieve", "deny": "deny"},
+    )
+    graph.add_edge("deny", END)
     graph.add_edge("retrieve", "select")
     graph.add_edge("select", "model")
     graph.add_conditional_edges(

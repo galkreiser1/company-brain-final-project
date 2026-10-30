@@ -23,7 +23,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from maya.config import MCP_SERVER_URL, REPO_ROOT
 import maya.memory
-from maya.graph import build_graph
+from maya.graph import REFUSAL, build_graph
 from maya.memory import DISTIL_PROMPT, PLANNER_PROMPT, estimate_tokens, render_memory
 from maya.planning import ASSISTANT_PROMPT, IMPORTANT_POINTERS, message_text, render_transcript
 from maya.retrieval import OpenSearchRetriever
@@ -239,6 +239,7 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
     return {
         "turn": turn,
         "plan": result["plan"],
+        "denied": answer == REFUSAL,  # the authorize step sent the turn down the deny path
         "loadout": result["loadout"],
         "tool_calls": tool_calls,
         "checks": check_turn(turn, result, tool_calls, answer),
@@ -414,7 +415,8 @@ def print_turn(number: int, outcome: dict) -> None:
     print(f"\nTurn {number}  {'PASS' if turn_passed(outcome) else 'FAIL'}  "
           f"{one_line(outcome['turn']['user'], 70, count_dropped=False)}")
     print(f"  plan:    {plan['current_intent']} · {needs} · "
-          f"subject: {plan['subject_name'] or '(none)'} → {plan['subject_employee_id']} · "
+          f"subject: {plan['subject_name'] or '(none)'} → {plan['subject_employee_id']} "
+          f"({'DENIED' if outcome['denied'] else 'allowed'}) · "
           f"facts: {len(plan['relevant_facts'])} · constraints: {len(plan['relevant_constraints'])}")
     loadout = outcome["loadout"]
     print(f"  loadout: {', '.join(loadout) or '(no tools)'} ({len(loadout)} of {TOOL_COUNT})")
