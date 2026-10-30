@@ -50,7 +50,7 @@ KNOWN_PROMPTS = {
 
 # Structured output works through a fake "tool" with the schema's name: the model
 # "calls" it to give its reply in that shape. These are those names, not real tools.
-OUTPUT_FORMATS = {"TurnPlan", "ConversationMemory"}
+OUTPUT_FORMATS = {"TurnPlan", "ConversationMemory", "MayaReply"}
 
 
 # In the log, old answers and tool results are cut to this many characters.
@@ -246,6 +246,7 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
         "distilled_upto": result.get("distilled_upto", 0),
         "distilled_upto_before": before,
         "evidence": result.get("evidence") or [],
+        "reply": result.get("reply") or {},  # the respond step's MayaReply, as a dict
         "searches": retriever.searches[first_search:],
         # The messages the memory doesn't cover yet: what the next check counts.
         "fresh": messages[result.get("distilled_upto", 0):],
@@ -320,21 +321,58 @@ def describe_searches(searches: list) -> str:
     return f"2 searches (2nd only: {', '.join(searches[1])})"
 
 
-def describe_evidence(evidence: list[dict], answer: str) -> str:
-    """The retrieved chunks on one line, with how many the answer cites.
+def citation_id(citation: dict) -> str:
+    """A citation's ID: its chunk_id for a document, its record_id for a record."""
+
+    return citation.get("chunk_id") or citation.get("record_id")
+
+
+def reply_citation_ids(reply: dict) -> set[str]:
+    """Every ID the reply cites: the answer's and every checklist item's."""
+
+    ids = {citation_id(c) for c in reply.get("citations", [])}
+    for item in (reply.get("checklist") or {}).get("items", []):
+        ids |= {citation_id(c) for c in item["citations"]}
+    return ids
+
+
+def describe_evidence(evidence: list[dict], reply: dict) -> str:
+    """The retrieved chunks on one line, with how many the reply cites.
 
     Like "3 chunks, 1 cited: policies/x.md#2 (0.9) CITED, ...". The number is the
-    reranker's score.
+    reranker's score. Citations come from the checked MayaReply, so only real ones count.
     """
 
     if not evidence:
         return "(none)"
+    cited_ids = reply_citation_ids(reply)
     chunks, cited = [], 0
     for chunk in evidence:
-        is_cited = chunk["chunk_id"] in answer
+        is_cited = chunk["chunk_id"] in cited_ids
         cited += is_cited
         chunks.append(f"{chunk['chunk_id']} ({chunk['score']:.1f})" + (" CITED" if is_cited else ""))
     return f"{len(evidence)} chunks, {cited} cited: {', '.join(chunks)}"
+
+
+def describe_citations(reply: dict) -> str:
+    """The answer's citations on one line, like "2: OT005, policies/x.md#2"."""
+
+    ids = [citation_id(c) for c in reply.get("citations", [])]
+    return f"{len(ids)}" + (f": {', '.join(ids)}" if ids else "")
+
+
+def describe_checklist(reply: dict) -> list[str]:
+    """The checklist as lines: its overall status, then one line per item."""
+
+    checklist = reply.get("checklist")
+    if not checklist:
+        return ["(none)"]
+    lines = [f"{checklist['status']} · {len(checklist['items'])} items"]
+    for item in checklist["items"]:
+        reason = f" ({item['reason']})" if item.get("reason") else ""
+        cites = ", ".join(citation_id(c) for c in item["citations"]) or "no citation"
+        lines.append(f"{item['status']:<10} {item['name']}{reason} [{cites}]")
+    return lines
 
 
 def turn_passed(outcome: dict) -> bool:
@@ -396,10 +434,12 @@ def print_turn(number: int, outcome: dict) -> None:
     tools = ", ".join(describe_tool_call(call) for call in outcome["tool_calls"])
     input_tokens = sum(call["input_tokens"] for call in calls)
     answer_calls = [call for call in calls if call["step"] == "model"]
-    most_tools = max(len(call["tools"]) for call in answer_calls)
+    # default=0: a denied turn has no answer call.
+    most_tools = max((len(call["tools"]) for call in answer_calls), default=0)
     # Messages the answer model saw, not counting its system prompt.
-    most_seen = max(len(call["messages"]) - 1 for call in answer_calls)
-    answer = describe_reply(calls[-1]["reply"])
+    most_seen = max((len(call["messages"]) - 1 for call in answer_calls), default=0)
+    reply = outcome["reply"]
+    answer = reply.get("answer", "")
 
     # How many calls each step made, like "plan 1, model 2".
     steps = [call["step"] for call in calls]
@@ -419,7 +459,12 @@ def print_turn(number: int, outcome: dict) -> None:
     print(f"  loadout: {', '.join(loadout) or '(no tools)'} ({len(loadout)} of {TOOL_COUNT})")
     print(f"  tools:   {tools or '(none)'}")
     print(f"  evidence: {describe_searches(outcome['searches'])} · "
-          f"{describe_evidence(outcome['evidence'], answer)}")
+          f"{describe_evidence(outcome['evidence'], reply)}")
+    print(f"  cites:   {describe_citations(reply)}")
+    first, *items = describe_checklist(reply)
+    print(f"  checklist: {first}")
+    for line in items:
+        print(f"    {line}")
     print(f"  checks:  {describe_checks(outcome['checks'])}")
     print(f"  cost:    {len(calls)} model calls ({per_step}) · {input_tokens:,} input tokens · "
           f"up to {most_tools} tools shown")
@@ -447,6 +492,10 @@ How to read this log:
     the answer CITED.
   - ‹ASSISTANT_PROMPT›, ‹IMPORTANT_POINTERS›, ‹PLANNER_PROMPT› and ‹DISTIL_PROMPT›
     stand for those prompts' full text (see maya/planning.py and maya/memory.py).
+  - step: respond is the last call (Nova Pro): it turns the answer into a MayaReply.
+    Code then drops every citation that points at nothing this conversation saw.
+    CITES lists the answer's checked citations; CHECKLIST shows each item's status
+    and citations (onboarding_status turns only). CITED in EVIDENCE counts these.
   - MEMORY at the end of a turn shows the saved notes, when there are any.
   - Maya loads only 5 of the MCP server's 10 tools (the database reads). Where the
     dataset expects a document tool, retrieve's evidence stands in for it.
@@ -505,7 +554,9 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
         "",
         f"CHECKS   {describe_checks(outcome['checks'])}",
         f"EVIDENCE {describe_searches(outcome['searches'])} · "
-        f"{describe_evidence(outcome['evidence'], describe_reply(outcome['model_calls'][-1]['reply']))}",
+        f"{describe_evidence(outcome['evidence'], outcome['reply'])}",
+        f"CITES    {describe_citations(outcome['reply'])}",
+        "CHECKLIST " + "\n  ".join(describe_checklist(outcome["reply"])),
         f"STATE    {outcome['saved_messages']} messages saved in thread {THREAD_ID}",
         f"MEMORY   {describe_memory(outcome)}",
     ]

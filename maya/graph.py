@@ -13,10 +13,12 @@ Each turn runs these steps:
   6. select    - plain code picks the turn's loadout (the tools the model may see).
   7. model     - the answer call: the plan + the last two turns, with only the
                  loadout's tools attached.
-  8. route     - after the model replies, decide what happens next (9a, 9b, or end).
+  8. route     - after the model replies, decide what happens next (9a, 9b, or 10).
   9a. tools    - (when the model asked for tools) run them, then back to step 7.
   9b. rearm    - (when needed records weren't looked up) delete that answer, and retry
                  step 7 once with every read tool.
+  10. respond  - turn the answer into a MayaReply (answer, citations, maybe a
+                 checklist), then code drops every citation it can't back up.
 
 Read in this order: AgentState, then the steps, then build_graph at the bottom.
 """
@@ -31,7 +33,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from maya.config import DATA_DIR
+from maya.config import DATA_DIR, RESPOND_MODEL_ID
 from maya.ingest import load_employee_ids
 from maya.loadout import maya_tools, select_tools
 from maya.memory import (
@@ -47,11 +49,13 @@ from maya.planning import (
     TurnPlan,
     answer_messages,
     build_context_plan,
+    respond_messages,
     message_text,
     recent_turns,
 )
+from maya.respond import add_sources, enforce_evidence, tool_result_ids
 from maya.retrieval import EvidenceRetriever, authorize_turn
-from maya.schemas import CallerContext, Evidence
+from maya.schemas import CallerContext, Evidence, MayaReply
 
 
 # STATE -----------------------------------------------------------------------
@@ -71,6 +75,9 @@ class AgentState(TypedDict):
     memory: dict                            # the notes (a ConversationMemory, as a dict)
     distilled_upto: int                     # messages before this index are in the memory
     evidence: list[dict]                    # this turn's document chunks (Evidence, as dicts)
+    reply: dict                             # this turn's MayaReply, as a dict
+    checklist: dict                         # the latest OnboardingChecklist; kept across turns
+    sources_seen: list[str]                 # every chunk_id and record ID seen so far
 
 
 # THE STEPS -------------------------------------------------------------------
@@ -167,10 +174,16 @@ def deny(state: AgentState) -> dict:
     """Step 4x (only when step 4 says no): reply with the fixed refusal. No model call.
 
     Also clears the turn's evidence and loadout, so nothing from the last turn is left
-    looking like this turn's.
+    looking like this turn's. The reply has no citations and no checklist.
     """
 
-    return {"messages": [AIMessage(REFUSAL)], "evidence": [], "loadout": [], "rearmed": False}
+    return {
+        "messages": [AIMessage(REFUSAL)],
+        "reply": MayaReply(answer=REFUSAL).model_dump(),
+        "evidence": [],
+        "loadout": [],
+        "rearmed": False,
+    }
 
 
 def missing_collections(required: list[str], evidence: list[Evidence]) -> list[str]:
@@ -274,14 +287,14 @@ def route(state: AgentState) -> str:
 
     - The model asked for tools          -> "tools" (step 9a)
     - It answered, but missed a lookup   -> "rearm" (step 9b, retry once)
-    - It answered                        -> END (the turn is over)
+    - It answered                        -> "respond" (step 10, then the turn is over)
     """
 
     if state["messages"][-1].tool_calls:
         return "tools"
     if lookup_was_missed(state):
         return "rearm"
-    return END
+    return "respond"
 
 
 def rearm(state: AgentState, all_tool_names: list[str]) -> dict:
@@ -298,6 +311,50 @@ def rearm(state: AgentState, all_tool_names: list[str]) -> dict:
         "rearmed": True,
         "messages": [RemoveMessage(id=unseen_answer.id)],  # delete by id, don't append
     }
+
+
+def reply_args(raw_message) -> dict:
+    """The responder's reply before any checks: the arguments of its MayaReply call.
+
+    Structured output works through a tool call named after the schema, so the reply
+    is that call's arguments. Raises an error if the model made no such call.
+    """
+
+    return raw_message.tool_calls[0]["args"]
+
+
+def respond(state: AgentState, responder) -> dict:
+    """Step 10: turn the answer into a MayaReply, keeping only citations code can check.
+
+    1. code:  add this turn's chunk_ids and record IDs to sources_seen.
+    2. model: the responder fills a MayaReply (respond_messages in planning.py).
+    3. code:  enforce_evidence drops citations not in sources_seen, and the checklist
+              if this topic doesn't want one. It works on the raw reply, so one bad
+              item can't sink the whole reply.
+    If the reply can't be read as a MayaReply (or the call fails), the turn still
+    ends: with the model's answer, no citations and no checklist.
+    """
+
+    plan = ContextPlan(**state["plan"])
+    current_turn = recent_turns(state["messages"], keep=1)
+    chunk_ids = [chunk["chunk_id"] for chunk in state.get("evidence") or []]
+    sources_seen = add_sources(state.get("sources_seen") or [],
+                               chunk_ids + tool_result_ids(current_turn))
+    # Code decides which turns get a checklist, not the model.
+    checklist_wanted = plan.current_intent == "onboarding_status"
+
+    try:
+        result = responder.invoke(respond_messages(state, plan, checklist_wanted))
+        # The answer the user reads is the answer model's, not a rewrite of it.
+        raw = {**reply_args(result["raw"]), "answer": message_text(state["messages"][-1])}
+        reply = enforce_evidence(raw, sources_seen, checklist_wanted, plan.subject_employee_id)
+    except Exception:  # no reply, or one that still breaks a rule: never fail the turn
+        reply = MayaReply(answer=message_text(state["messages"][-1]))
+
+    update = {"reply": reply.model_dump(), "sources_seen": sources_seen}
+    if reply.checklist is not None:
+        update["checklist"] = reply.checklist.model_dump()  # replaces the saved one
+    return update
 
 
 # WIRING ----------------------------------------------------------------------
@@ -328,6 +385,8 @@ def build_graph(tools: list, retriever: EvidenceRetriever):
     # {full name: employee id}, read once here, to fill each plan's subject_employee_id.
     employee_ids = load_employee_ids(DATA_DIR)
     distiller = get_model().with_structured_output(ConversationMemory, include_raw=True)
+    # A stronger model for this one call: see RESPOND_MODEL_ID in config.py.
+    responder = get_model(RESPOND_MODEL_ID).with_structured_output(MayaReply, include_raw=True)
 
     graph = StateGraph(AgentState)
     graph.add_node("distil", partial(distil, distiller=distiller))
@@ -339,11 +398,12 @@ def build_graph(tools: list, retriever: EvidenceRetriever):
         call_model, base_model=base_model, tools_by_name=tools_by_name,
     ))
     graph.add_node("rearm", partial(rearm, all_tool_names=all_tool_names))
+    graph.add_node("respond", partial(respond, responder=responder))
     # Step 9a: LangGraph's ToolNode runs the tools the model asked for.
     graph.add_node("tools", ToolNode(tools))
 
     # START -> (distil) -> plan -> (authorize) -> retrieve -> select -> model, then
-    # model -> tools / rearm / END, and tools and rearm both go back to model.
+    # model -> tools / rearm / respond -> END, and tools and rearm go back to model.
     # A denied turn goes plan -> deny -> END instead.
     graph.add_conditional_edges(
         START, distil_or_plan, {"distil": "distil", "plan": "plan"},
@@ -356,8 +416,9 @@ def build_graph(tools: list, retriever: EvidenceRetriever):
     graph.add_edge("retrieve", "select")
     graph.add_edge("select", "model")
     graph.add_conditional_edges(
-        "model", route, {"tools": "tools", "rearm": "rearm", END: END},
+        "model", route, {"tools": "tools", "rearm": "rearm", "respond": "respond"},
     )
+    graph.add_edge("respond", END)
     graph.add_edge("tools", "model")
     graph.add_edge("rearm", "model")
 

@@ -21,6 +21,9 @@ DATA_DIR = REPO_ROOT / os.environ.get("NOVAOPS_DATA_DIR", "data/novaops")
 
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://127.0.0.1:9877/mcp")
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.amazon.nova-2-lite-v1:0")
+# The respond step's model. Nova 2 Lite wrote broken JSON for the nested MayaReply
+# (0 of 8 valid, stopReason "malformed_tool_use"); Nova Pro wrote it 4 of 4 times.
+RESPOND_MODEL_ID = os.environ.get("BEDROCK_RESPOND_MODEL_ID", "us.amazon.nova-pro-v1:0")
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 # Document search: the OpenSearch Serverless collection (found by name) and the index

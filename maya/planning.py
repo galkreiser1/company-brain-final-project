@@ -397,3 +397,66 @@ def answer_messages(state: dict, plan: TurnPlan) -> list:
     )
     recent = conversation_window(state["messages"], keep=KEEP_VERBATIM_TURNS)
     return [SystemMessage(system_prompt), *recent]
+
+
+# THE RESPOND CALL ------------------------------------------------------------
+# The last model call of a turn. It turns the answer into a MayaReply (answer,
+# citations, maybe a checklist). Code then checks its citations (maya/respond.py).
+
+RESPOND_PROMPT = (
+    "You turn an assistant's answer into a structured reply for NovaOps HR and IT "
+    "staff. Use only the sources shown below.\n"
+    "Rules:\n"
+    "- Cite every claim. A citation is either a document chunk (source = its doc_id, "
+    "chunk_id = the full chunk_id shown in square brackets, e.g. "
+    "policies/onboarding_policy.md#2, not just the number) or a "
+    "database record (source = the tool that returned it, record_id = the record's "
+    "id, e.g. OT005). Use only the chunk_ids and record IDs shown below.\n"
+    "- answer: copy the ANSWER TO STRUCTURE word for word.\n"
+    "- citations: every source the answer's claims rest on. If the answer states any "
+    "fact, cite at least one.\n"
+    "- A task from list_onboarding_tasks maps to an item status: completed -> "
+    "complete, pending or planned -> pending, blocked -> blocked. A blocked item's "
+    "reason says WHY it is blocked (e.g. a seat limit), taken from the sources.\n"
+    "- A required system or piece of equipment with no task in list_onboarding_tasks "
+    "is proposed, even if a document requires it.\n"
+    "- When sources disagree, the newer 'updated' date wins; then the more specific "
+    "source (about this person or system) wins over a general policy. If it is still "
+    "not clear, mark the item unresolved and cite both sources.\n"
+    "- Never say that access was granted.\n"
+    "- Fill the checklist only if CHECKLIST WANTED says yes; otherwise leave it empty."
+)
+
+
+def render_tool_results(messages: list) -> str:
+    """This turn's tool results, each labelled with the tool that returned it."""
+
+    results = [
+        f"[{getattr(message, 'name', '?')}] {message_text(message)}"
+        for message in messages
+        if isinstance(message, ToolMessage)
+    ]
+    return "\n\n".join(results) or "(none)"
+
+
+def respond_messages(state: dict, plan: TurnPlan, checklist_wanted: bool) -> list:
+    """What the respond call receives: its rules, then everything it may cite.
+
+    Gets: the state, the turn's plan, and whether code wants a checklist this turn.
+    Returns: [system prompt, one user message] with the plan's facts and constraints,
+    the model's final answer, this turn's documents and tool results, and the saved
+    checklist (so a recap turn can reuse it).
+    """
+
+    current_turn = recent_turns(state["messages"], keep=1)
+    saved = state.get("checklist")
+    content = (
+        f"CHECKLIST WANTED: {'yes' if checklist_wanted else 'no'}\n\n"
+        f"Established facts:\n{_bullets(plan.relevant_facts)}\n"
+        f"Constraints still in force:\n{_bullets(plan.relevant_constraints)}\n\n"
+        f"--- ANSWER TO STRUCTURE ---\n{message_text(state['messages'][-1])}\n\n"
+        f"--- TOOL RESULTS THIS TURN ---\n{render_tool_results(current_turn)}"
+        f"{render_evidence(state.get('evidence') or [])}\n\n"
+        f"--- SAVED CHECKLIST ---\n{json.dumps(saved, indent=1) if saved else '(none)'}"
+    )
+    return [SystemMessage(RESPOND_PROMPT), HumanMessage(content)]
