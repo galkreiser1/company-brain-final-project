@@ -113,7 +113,8 @@ class MayaReply(BaseModel):
 
 
 # THE WEBEX HANDOFF -------------------------------------------------------------
-# Not used until Milestone 4.
+# Maya has no write tool. On a confirmed Webex request, code sends one WebexHandoff
+# to the separate Webex approval workflow (maya/ports.py), which answers "pending".
 
 class WebexHandoff(BaseModel):
     """A blocked licence passed on to a person to sort out, e.g. Webex for E001."""
@@ -139,3 +140,12 @@ def make_idempotency_key(thread_id: str, employee_id: str, software: str) -> str
 
     joined = "|".join([thread_id, employee_id, software])
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+class PendingAccessResult(BaseModel):
+    """What the Webex workflow answers: the request is in, and waits for approval."""
+
+    workflow: Literal["webex_access"]
+    status: Literal["pending"]  # never "granted": approval happens outside Maya
+    request_id: str             # the workflow's reference, e.g. "WX-13acdeaf"
+    idempotency_key: str        # the handoff's key, so a repeat can be matched to it
