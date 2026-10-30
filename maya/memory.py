@@ -155,7 +155,7 @@ PLANNER_PROMPT = (
     + "\n- You are given distilled memory plus the raw conversation since it was written. "
       "The memory's topic is the session's history, not this turn.\n"
     + "- Checklists, seat counts, tickets and inventory in memory are a SNAPSHOT; if the "
-      "user asks what the state is NOW, requires_tools is True."
+      "user asks what the state is NOW, needs_records is True."
 )
 
 

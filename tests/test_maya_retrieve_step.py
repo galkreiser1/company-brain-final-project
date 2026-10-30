@@ -10,7 +10,7 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from maya.graph import retrieve
-from maya.planning import TurnPlan
+from maya.planning import TurnPlan, build_context_plan
 from maya.schemas import CallerContext, Evidence
 
 
@@ -45,7 +45,7 @@ class FakeRetriever:
         return [OFFER_LETTER]
 
 
-def make_state(requires_tools: bool = True, search_query: str = "Maya Cohen offer letter",
+def make_state(needs_documents: bool = True, search_query: str = "Maya Cohen offer letter",
                intent: str = "employee_lookup") -> dict:
     """A state just after the plan step: one user message and the plan.
 
@@ -53,11 +53,13 @@ def make_state(requires_tools: bool = True, search_query: str = "Maya Cohen offe
     letter covers, so by default one search is enough.
     """
 
-    plan = TurnPlan(
+    turn_plan = TurnPlan(
         current_intent=intent,
-        requires_tools=requires_tools,
+        needs_documents=needs_documents,
+        needs_records=False,
         search_query=search_query,
     )
+    plan = build_context_plan(turn_plan, employee_ids={})
     return {"messages": [HumanMessage(USER_MESSAGE)], "plan": plan.model_dump()}
 
 
@@ -83,10 +85,11 @@ def test_no_caller_means_no_search(caller):
     assert retriever.calls == []
 
 
-def test_no_lookup_needed_means_no_search():
+def test_no_documents_needed_means_no_search():
     retriever = FakeRetriever()
 
-    result = retrieve(make_state(requires_tools=False), make_config(**SARA_HR), retriever=retriever)
+    result = retrieve(make_state(needs_documents=False), make_config(**SARA_HR),
+                      retriever=retriever)
 
     assert result == {"evidence": []}
     assert retriever.calls == []

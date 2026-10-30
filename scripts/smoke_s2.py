@@ -176,6 +176,9 @@ def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[
     checks.append((label, intent in accepted))
 
     wants_tools = turn["should_use_tools"]
+    plan_wants = plan["needs_documents"] or plan["needs_records"]
+    checks.append(("plan needs a lookup" if wants_tools else "plan needs no lookup",
+                   plan_wants == wants_tools))
     if wants_tools and by_evidence:
         checks.append(("tools used (evidence instead, even after rearm)", True))
     else:
@@ -405,11 +408,13 @@ def print_turn(number: int, outcome: dict) -> None:
     per_step = ", ".join(f"{step} {steps.count(step)}" for step in dict.fromkeys(steps))
 
     plan = outcome["plan"]
-    needs = "needs tools" if plan["requires_tools"] else "no tools needed"
+    needed = [name for name in ("documents", "records") if plan[f"needs_{name}"]]
+    needs = "needs " + " + ".join(needed) if needed else "needs nothing new"
 
     print(f"\nTurn {number}  {'PASS' if turn_passed(outcome) else 'FAIL'}  "
           f"{one_line(outcome['turn']['user'], 70, count_dropped=False)}")
     print(f"  plan:    {plan['current_intent']} · {needs} · "
+          f"subject: {plan['subject_name'] or '(none)'} → {plan['subject_employee_id']} · "
           f"facts: {len(plan['relevant_facts'])} · constraints: {len(plan['relevant_constraints'])}")
     loadout = outcome["loadout"]
     print(f"  loadout: {', '.join(loadout) or '(no tools)'} ({len(loadout)} of {TOOL_COUNT})")

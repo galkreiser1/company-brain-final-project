@@ -3,15 +3,16 @@
 Each turn runs these steps:
   1. check  - is it time to distil? (enough new messages since the last time)
   2. distil - (only when step 1 says yes) turn the new messages into updated memory.
-  3. plan     - the planner reads the memory + newer messages, and writes the plan.
-  4. retrieve - plain code searches the documents with the plan's search_query, as
+  3. plan     - the planner reads the memory + newer messages, and writes the plan;
+                code adds the subject's id and the collections to search.
+  4. retrieve - plain code searches the plan's collections with its search_query, as
                 the caller (who is set by code, never by a model).
   5. select   - plain code picks the turn's loadout (the tools the model may see).
   6. model    - the answer call: the plan + the last two turns, with only the
                 loadout's tools attached.
   7. route    - after the model replies, decide what happens next (8a, 8b, or end).
   8a. tools   - (when the model asked for tools) run them, then back to step 6.
-  8b. rearm   - (when a needed lookup was missed) delete that answer, and retry
+  8b. rearm   - (when needed records weren't looked up) delete that answer, and retry
                 step 6 once with every read tool.
 
 Read in this order: AgentState, then the steps, then build_graph at the bottom.
@@ -27,7 +28,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from maya.loadout import REQUIRED_COLLECTIONS, WRITE_TOOLS, select_tools
+from maya.config import DATA_DIR
+from maya.ingest import load_employee_ids
+from maya.loadout import WRITE_TOOLS, select_tools
 from maya.memory import (
     ConversationMemory,
     distiller_messages,
@@ -36,7 +39,14 @@ from maya.memory import (
     planner_messages,
 )
 from maya.model import get_model
-from maya.planning import TurnPlan, answer_messages, message_text, recent_turns
+from maya.planning import (
+    ContextPlan,
+    TurnPlan,
+    answer_messages,
+    build_context_plan,
+    message_text,
+    recent_turns,
+)
 from maya.retrieval import EvidenceRetriever
 from maya.schemas import CallerContext, Evidence
 
@@ -52,7 +62,7 @@ class AgentState(TypedDict):
     """
 
     messages: Annotated[list, add_messages]  # the whole conversation
-    plan: dict                              # this turn's plan (a TurnPlan, as a dict)
+    plan: dict                              # this turn's plan (a ContextPlan, as a dict)
     loadout: list[str]                      # tools the model may see this turn
     rearmed: bool                           # has this turn's fallback been used?
     memory: dict                            # the notes (a ConversationMemory, as a dict)
@@ -99,18 +109,21 @@ async def distil(state: AgentState, distiller) -> dict:
     }
 
 
-async def plan_turn(state: AgentState, planner) -> dict:
+async def plan_turn(state: AgentState, planner, employee_ids: dict[str, str]) -> dict:
     """Step 3: ask the planner for this turn's plan, and save it in the state.
 
     The planner gets the memory plus only the newer messages (planner_messages in
-    memory.py). If its answer can't be read as a TurnPlan, use a fallback plan:
-    topic "other", tools needed.
+    memory.py). Code then adds the subject's id and the collections to search
+    (build_context_plan). If the planner's answer can't be read as a TurnPlan, use a
+    fallback plan: topic "other", documents and records both needed, no subject.
     """
 
     result = await planner.ainvoke(planner_messages(state))
-    plan = result["parsed"]
-    if not plan:
-        plan = TurnPlan(current_intent="other", requires_tools=True)
+    turn_plan = result["parsed"]
+    if not turn_plan:
+        turn_plan = TurnPlan(current_intent="other", needs_documents=True,
+                             needs_records=True)
+    plan = build_context_plan(turn_plan, employee_ids)
     return {"plan": plan.model_dump()}
 
 
@@ -129,11 +142,11 @@ def caller_from_config(config: RunnableConfig) -> CallerContext | None:
     return CallerContext(caller_id=caller_id, user_group=user_group)
 
 
-def missing_collections(intent: str, evidence: list[Evidence]) -> list[str]:
-    """The collections this topic needs (REQUIRED_COLLECTIONS) that the evidence lacks."""
+def missing_collections(required: list[str], evidence: list[Evidence]) -> list[str]:
+    """The required collections (the plan's required_evidence) the evidence lacks."""
 
     found = {chunk.collection for chunk in evidence}
-    return [name for name in REQUIRED_COLLECTIONS.get(intent, []) if name not in found]
+    return [name for name in required if name not in found]
 
 
 def merge_evidence(first: list[Evidence], extra: list[Evidence]) -> list[Evidence]:
@@ -147,7 +160,8 @@ def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetri
     """Step 4: search the documents for this turn. No model call of its own.
 
     - Unknown caller: no evidence ("fail closed": no search beats a search as nobody).
-    - The plan needs no lookup: no search.
+    - The plan requires no collections (no documents needed, or topic "other"): no
+      search.
     - Otherwise: one search with the plan's search_query (or the user's message, if
       the planner left it empty).
     - If the results lack a collection the topic needs, one more search, limited to
@@ -158,14 +172,14 @@ def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetri
     """
 
     caller = caller_from_config(config)
-    plan = TurnPlan(**state["plan"])
-    if caller is None or not plan.requires_tools:
+    plan = ContextPlan(**state["plan"])
+    if caller is None or not plan.required_evidence:
         return {"evidence": []}
 
     query = plan.search_query or message_text(state["messages"][-1])
     evidence = retriever.search(query, caller)
 
-    missing = missing_collections(plan.current_intent, evidence)
+    missing = missing_collections(plan.required_evidence, evidence)
     if missing:
         extra = retriever.search(query, caller, collections=missing)
         evidence = merge_evidence(evidence, extra)
@@ -180,7 +194,7 @@ def select(state: AgentState, all_tool_names: list[str]) -> dict:
     Also resets `rearmed` for the new turn.
     """
 
-    chosen = select_tools(TurnPlan(**state["plan"]))
+    chosen = select_tools(ContextPlan(**state["plan"]))
     if chosen is None:
         loadout = all_tool_names
     else:
@@ -205,7 +219,7 @@ def call_model(state: AgentState, base_model, tools_by_name: dict) -> dict:
     """
 
     model = model_with_tools(base_model, tools_by_name, state["loadout"])
-    plan = TurnPlan(**state["plan"])  # the state stores the plan as a plain dict
+    plan = ContextPlan(**state["plan"])  # the state stores the plan as a plain dict
     response = model.invoke(answer_messages(state, plan))
     return {"messages": [response]}
 
@@ -218,11 +232,14 @@ def used_tool_this_turn(messages: list) -> bool:
 
 
 def lookup_was_missed(state: AgentState) -> bool:
-    """True if the plan needed a lookup, none happened, and we haven't retried yet."""
+    """True if the plan needed records, no tool ran, and we haven't retried yet.
 
-    plan = TurnPlan(**state["plan"])
+    Only records count: documents come from the retrieve step, not from tools.
+    """
+
+    plan = ContextPlan(**state["plan"])
     return (
-        plan.requires_tools
+        plan.needs_records
         and not state["rearmed"]
         and not used_tool_this_turn(state["messages"])
     )
@@ -281,11 +298,13 @@ def build_graph(tools: list, retriever: EvidenceRetriever):
     # The planner must reply with a TurnPlan. include_raw=True returns a dict whose
     # "parsed" is None when the reply can't be read as one, instead of raising an error.
     planner = get_model().with_structured_output(TurnPlan, include_raw=True)
+    # {full name: employee id}, read once here, to fill each plan's subject_employee_id.
+    employee_ids = load_employee_ids(DATA_DIR)
     distiller = get_model().with_structured_output(ConversationMemory, include_raw=True)
 
     graph = StateGraph(AgentState)
     graph.add_node("distil", partial(distil, distiller=distiller))
-    graph.add_node("plan", partial(plan_turn, planner=planner))
+    graph.add_node("plan", partial(plan_turn, planner=planner, employee_ids=employee_ids))
     graph.add_node("retrieve", partial(retrieve, retriever=retriever))
     graph.add_node("select", partial(select, all_tool_names=all_tool_names))
     graph.add_node("model", partial(

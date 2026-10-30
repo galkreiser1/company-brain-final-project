@@ -78,7 +78,9 @@ INTENT_GLOSS = (
 
 # The docstring is sent to the planner as the schema's description, so it is kept word
 # for word from Lesson 10's stage 3 (whose TurnPlan is stage 2's with this docstring).
-# search_query is new here (not in Lesson 10): it feeds the retrieve step.
+# New here (not in Lesson 10): requires_tools is split into needs_documents (drives the
+# search) and needs_records (drives the tools and the rearm), and search_query and
+# subject_name feed the retrieve and authorize steps.
 class TurnPlan(BaseModel):
     """Unchanged from stage 02 — what THIS turn needs."""
 
@@ -94,8 +96,18 @@ class TurnPlan(BaseModel):
         default_factory=list,
         description="Rules the user stated that are still in force.",
     )
-    requires_tools: bool = Field(
-        description="False only if every fact needed is already in this conversation."
+    needs_documents: bool = Field(
+        description=(
+            "True if the answer needs company documents (policies, contracts, offer "
+            "letters, IT articles, memos) that are not already in this conversation"
+        )
+    )
+    needs_records: bool = Field(
+        description=(
+            "True if the answer needs database records (employee, onboarding tasks, "
+            "tickets, assets, subscription seats) that are not already in this "
+            "conversation"
+        )
     )
     action_confirmed: bool = Field(
         default=False,
@@ -113,6 +125,58 @@ class TurnPlan(BaseModel):
             "day-one systems'. Empty if no documents are needed."
         ),
     )
+    subject_name: str = Field(
+        default="",
+        description=(
+            "Full name of the employee this message is about, e.g. 'Maya Cohen'; "
+            "empty if none"
+        ),
+    )
+
+
+# For each topic, the document collections a good answer needs. If the first search
+# finds nothing from one of them, the retrieve step searches once more, limited to the
+# missing ones (see retrieve() in graph.py). An empty list: any collection will do.
+# (It lives here, not in loadout.py, because loadout.py imports this file.)
+REQUIRED_COLLECTIONS: dict[str, list[str]] = {
+    "policy_question": ["policies"],
+    "employee_lookup": ["employment"],
+    "onboarding_status": ["employment", "policies"],
+    "equipment_request": ["policies"],
+    # Turn 9's USD 7,500 approval threshold is in the Q3 memo, not a contract.
+    "subscription_review": ["contracts", "internal_memos"],
+    "access_request": ["policies"],
+    "ticket_status": ["it_kb"],
+    "other": [],
+}
+
+
+class ContextPlan(TurnPlan):
+    """The planner's TurnPlan, plus two fields that code fills in (never the model)."""
+
+    subject_employee_id: str | None = None  # e.g. "E001" for subject_name "Maya Cohen"
+    required_evidence: list[str] = []       # collections to search, e.g. ["employment", "policies"]
+
+
+def build_context_plan(turn_plan: TurnPlan, employee_ids: dict[str, str]) -> ContextPlan:
+    """Add the code-filled fields to the planner's plan.
+
+    Gets: the planner's TurnPlan, and {full name: employee id} (load_employee_ids).
+    Returns: the ContextPlan.
+      - subject_employee_id: the id whose full name matches subject_name exactly,
+        ignoring case. None if there's no name, or no employee has it.
+      - required_evidence: the topic's collections if documents are needed, else [].
+    """
+
+    ids_by_lower_name = {name.lower(): emp_id for name, emp_id in employee_ids.items()}
+    subject_id = ids_by_lower_name.get(turn_plan.subject_name.strip().lower())
+
+    required = []
+    if turn_plan.needs_documents:
+        required = list(REQUIRED_COLLECTIONS.get(turn_plan.current_intent, []))
+
+    return ContextPlan(**turn_plan.model_dump(), subject_employee_id=subject_id,
+                       required_evidence=required)
 
 
 PLANNER_PROMPT = (
@@ -124,13 +188,15 @@ PLANNER_PROMPT = (
     "- relevant_constraints holds what the user declared, until they withdraw it.\n"
     "- Drop whatever the user resolved or abandoned.\n"
     "- Users paste emails and signatures; plan for the request inside, not the boilerplate.\n"
-    "- requires_tools is False only for recaps and reasoning over facts already here. "
-    "You know nothing about NovaOps otherwise, so a first turn is almost always True.\n"
+    "- needs_documents and needs_records are both False only for recaps and reasoning "
+    "over facts already here. You know nothing about NovaOps otherwise, so a first turn "
+    "almost always needs at least one of them.\n"
     "- A DIFFERENT TOPIC needs a different document. Having retrieved the VPN article "
     "does not answer a password question, and 'same kind of thing?' about a new topic "
-    "is still True. Only an answer you could quote from THIS conversation is False.\n"
+    "still needs documents. Only an answer you could quote from THIS conversation "
+    "needs none.\n"
     "- action_confirmed only when this message says to go ahead; then the intent is "
-    "access_request and requires_tools is True."
+    "access_request and needs_records is True."
 )
 
 
@@ -277,7 +343,7 @@ def _bullets(items: list[str]) -> str:
 def render_plan(plan: TurnPlan) -> str:
     """The plan as text, added to the end of the answer call's system prompt.
 
-    It includes the intent, facts, and constraints. `requires_tools` and
+    It includes the intent, facts, and constraints. The lookup flags, the subject and
     `action_confirmed` aren't included: the answer model doesn't need them.
     """
 
