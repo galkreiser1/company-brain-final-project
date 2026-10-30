@@ -52,6 +52,16 @@ Maya loads 5 of the MCP server's 10 tools: `get_employee`, `list_onboarding_task
 - **The 4 document tools** (`search_hr_documents`, `search_knowledge_base`, `list_policies`, `get_policy`) are never loaded either. They return any document to anyone. Documents come only from Maya's own OpenSearch search, which filters by who is asking.
 - **Effect on the golden dataset:** S2 turns 2, 6 and 9 expect a document tool. Maya's search covers them instead, so the smoke test accepts retrieved evidence in place of those tools.
 
+## The Webex handoff (S2 turn 10)
+
+Maya never writes to a system. When the user confirms a Webex access request ("go ahead and file it"), code hands it off once to the separate Webex approval workflow and replies "pending".
+
+- The handoff goes through `WebexPort` (`maya/ports.py`), passed to `build_graph`. The turn makes no tool call, no search and no answer-model call.
+- Code decides, not the model: the planner must mark it a confirmed `access_request`, the user's message must say "Webex", and the subject must be a known employee.
+- The idempotency key (a hash of thread + employee + software) is saved with the result. Replaying the turn finds the key and sends nothing again; the smoke run replays turn 10 to prove it.
+- The reply never says "granted". If the workflow can't be reached, nothing is saved and the reply says nothing was sent.
+- Tests and the smoke run use `FakeWebexPort`, which records every call. The real Webex workflow comes later (Lesson 9).
+
 ## Running
 
 From the project root (needs Lesson 10's MCP server running on 127.0.0.1:9877):
