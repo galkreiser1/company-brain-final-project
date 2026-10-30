@@ -204,7 +204,8 @@ PLANNER_PROMPT = (
     "still needs documents. Only an answer you could quote from THIS conversation "
     "needs none.\n"
     "- action_confirmed only when this message says to go ahead; then the intent is "
-    "access_request and needs_records is True."
+    "access_request, and needs_documents and needs_records are both False (filing it "
+    "needs no lookups)."
 )
 
 

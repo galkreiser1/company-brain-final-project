@@ -27,6 +27,7 @@ from maya.config import MCP_SERVER_URL, REPO_ROOT
 import maya.memory
 from maya.graph import REFUSAL, build_graph
 from maya.loadout import DOCUMENT_TOOLS, MAYA_READ_TOOLS
+from maya.ports import FakeWebexPort
 from maya.memory import DISTIL_PROMPT, PLANNER_PROMPT, estimate_tokens, render_memory
 from maya.planning import ASSISTANT_PROMPT, IMPORTANT_POINTERS, message_text, render_transcript
 from maya.retrieval import OpenSearchRetriever
@@ -596,7 +597,8 @@ def turns_to_run() -> int:
 async def main(turn_count: int) -> None:
     tools = await load_tools()
     retriever = RecordingRetriever(OpenSearchRetriever())
-    graph = build_graph(tools, retriever)
+    webex = FakeWebexPort()  # records each handoff instead of reaching a real workflow
+    graph = build_graph(tools, retriever, webex)
     recorder = ModelCallRecorder()
     session = load_session()
     config = {
