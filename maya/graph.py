@@ -204,12 +204,12 @@ def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetri
     """Step 5: search the documents for this turn. No model call of its own.
 
     - Unknown caller: no evidence ("fail closed": no search beats a search as nobody).
-    - The plan requires no collections (no documents needed, or topic "other"): no
-      search.
+    - The plan needs no documents: no search.
     - Otherwise: one search with the plan's search_query (or the user's message, if
       the planner left it empty).
-    - If the results lack a collection the topic needs, one more search, limited to
-      the missing collections. Never a third, even if that one finds nothing.
+    - If the results lack a collection the topic needs (required_evidence), one more
+      search, limited to the missing collections. Never a third, even if that one
+      finds nothing. A topic with no required collections ("other") never needs one.
     Always sets `evidence`, so last turn's chunks never carry over.
 
     LangGraph passes `config` in because the function has a parameter of that name.
@@ -217,7 +217,7 @@ def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetri
 
     caller = caller_from_config(config)
     plan = ContextPlan(**state["plan"])
-    if caller is None or not plan.required_evidence:
+    if caller is None or not plan.needs_documents:
         return {"evidence": []}
 
     query = plan.search_query or message_text(state["messages"][-1])

@@ -119,6 +119,17 @@ def test_empty_search_query_falls_back_to_the_users_message():
     assert retriever.calls[0]["query"] == USER_MESSAGE
 
 
+def test_topic_with_no_required_collections_still_searches():
+    # "other" (also the planner-failure fallback's topic) requires no collection, but
+    # still needs documents: one search over all collections, and no extra one.
+    retriever = FakeRetriever()
+
+    retrieve(make_state(intent="other"), make_config(**SARA_HR), retriever=retriever)
+
+    assert len(retriever.calls) == 1
+    assert retriever.calls[0]["collections"] is None
+
+
 # THE EXTRA SEARCH ------------------------------------------------------------
 # onboarding_status needs "employment" and "policies". The first search returns
 # only the offer letter (employment), so "policies" is missing.
