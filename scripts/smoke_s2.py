@@ -1,7 +1,8 @@
 """Smoke test: run the Maya agent on the first turns of golden session S2.
 
 Needs Lesson 10's MCP server running. Run from the repo root:
-    .venv/bin/python -m scripts.smoke_s2
+    .venv/bin/python -m scripts.smoke_s2              # turns 1-3
+    .venv/bin/python -m scripts.smoke_s2 --turns 12   # the whole session
 
 All turns run on one thread_id, so they form one conversation. Two outputs:
   - the terminal: a short summary per turn (tools called, checks, cost);
@@ -12,6 +13,7 @@ The turns come from data/GOLDEN-DATASETS.json (search for "S2-onboarding-maya").
 The checks are a simple version of Lesson 10's evals, not the full thing.
 """
 
+import argparse
 import asyncio
 import json
 import textwrap
@@ -33,7 +35,8 @@ from maya.retrieval import OpenSearchRetriever
 GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"
 LOG_FILE = REPO_ROOT / "runs" / "smoke_s2.log"
 SESSION_ID = "S2-onboarding-maya"
-TURNS_TO_RUN = 3
+TURNS_TO_RUN = 3  # the default; --turns changes it
+MAX_TURNS = 12   # S2 has 12 turns
 
 # The conversation's ID. The checkpointer saves the state under it, so every turn sent
 # with the same thread_id continues the same conversation.
@@ -163,11 +166,12 @@ def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[
     by_evidence = covered_by_evidence(result.get("evidence"))
     checks = []
 
-    # "a|b" in the dataset means either intent is accepted.
+    # "a|b" in the dataset means either intent is accepted; null means not checked.
     intent = plan["current_intent"]
-    accepted = turn["expected_intent"].split("|")
-    label = f"intent {intent}" + ("" if intent in accepted else f" (expected {turn['expected_intent']})")
-    checks.append((label, intent in accepted))
+    if turn.get("expected_intent"):
+        accepted = turn["expected_intent"].split("|")
+        label = f"intent {intent}" + ("" if intent in accepted else f" (expected {turn['expected_intent']})")
+        checks.append((label, intent in accepted))
 
     wants_tools = turn["should_use_tools"]
     plan_wants = plan["needs_documents"] or plan["needs_records"]
@@ -192,10 +196,20 @@ def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[
         passed = all(arg_check_passes(check, tool_calls) for check in turn["arg_checks"])
         checks.append(("args", passed))
 
-    facts = turn.get("required_facts", [])
-    missing = [fact for fact in facts if fact.lower() not in answer.lower()]
+    # Each fact may list alternatives, "a|b": any one of them in the answer is enough.
+    facts = turn.get("required_facts") or []
+    missing = [
+        fact for fact in facts
+        if not any(option.lower() in answer.lower() for option in fact.split("|"))
+    ]
     label = f"facts {', '.join(facts)}" + (f" (missing {', '.join(missing)})" if missing else "")
     checks.append((label, not missing))
+
+    # Facts that must NOT appear, e.g. a closed tangent's ticket on a later turn.
+    leaked = [fact for fact in turn.get("forbidden_facts") or [] if fact.lower() in answer.lower()]
+    if turn.get("forbidden_facts"):
+        checks.append((f"no forbidden facts" + (f" (found {', '.join(leaked)})" if leaked else ""),
+                       not leaked))
 
     forbidden = [name for name in turn.get("forbidden_tools", []) if name in called]
     label = f"forbidden tool called: {', '.join(forbidden)}" if forbidden else "no forbidden tool"
@@ -281,12 +295,15 @@ def describe_checks(checks: list) -> str:
 
 
 def was_rearmed(call: dict, calls: list) -> bool:
-    """True for an answer that rearm deleted: written without tools, but not the last call.
+    """True for an answer that rearm deleted: written without tools, but not the last
+    answer call (respond runs after the last one, so it isn't the last call overall).
 
     Only rearm makes the graph call the model again after a plain answer.
     """
 
-    return call["step"] == "model" and not call["reply"].tool_calls and call is not calls[-1]
+    answer_calls = [c for c in calls if c["step"] == "model"]
+    return (call["step"] == "model" and not call["reply"].tool_calls
+            and call is not answer_calls[-1])
 
 
 def describe_memory(outcome: dict) -> str:
@@ -567,7 +584,16 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
 
 # MAIN ------------------------------------------------------------------------
 
-async def main() -> None:
+def turns_to_run() -> int:
+    """How many S2 turns to run: --turns N (1-12), or TURNS_TO_RUN."""
+
+    parser = argparse.ArgumentParser(description="Run the first N turns of session S2.")
+    parser.add_argument("--turns", type=int, default=TURNS_TO_RUN,
+                        choices=range(1, MAX_TURNS + 1), metavar=f"1-{MAX_TURNS}")
+    return parser.parse_args().turns
+
+
+async def main(turn_count: int) -> None:
     tools = await load_tools()
     retriever = RecordingRetriever(OpenSearchRetriever())
     graph = build_graph(tools, retriever)
@@ -582,7 +608,7 @@ async def main() -> None:
         },
         "callbacks": [recorder],
     }
-    turns = session["turns"][:TURNS_TO_RUN]
+    turns = session["turns"][:turn_count]
     print(f"Smoke test: {SESSION_ID}, turns 1-{len(turns)} · {len(tools)} tools from MCP, Maya loads {TOOL_COUNT} · "
           f"caller {session['caller_id']} ({session['caller_group']})")
 
@@ -603,4 +629,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(turns_to_run()))
