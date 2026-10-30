@@ -115,6 +115,13 @@ class ModelCallRecorder(BaseCallbackHandler):
         call["reply"] = response.generations[0][0].message
         call["input_tokens"] = (call["reply"].usage_metadata or {}).get("input_tokens", 0)
 
+    def on_llm_error(self, error, *, run_id, **kwargs):
+        # A failed call (e.g. Bedrock's malformed_tool_use) has no reply. Keep the error
+        # so the log can show it; the graph's own fallback handles the turn.
+        call = self._open_calls.pop(run_id, None)
+        if call is not None:
+            call["error"] = f"{type(error).__name__}: {error}"
+
 
 # RECORDING EVERY SEARCH ------------------------------------------------------
 
@@ -229,12 +236,59 @@ def latest_turn_start(messages: list) -> int:
     )
 
 
+def turn_handoffs(webex: FakeWebexPort, first: int, result: dict) -> list[dict]:
+    """The handoffs sent this turn, each with the result the graph saved for it.
+
+    The fake port records what was really sent, so a handoff the graph reused (not
+    resent) isn't counted.
+    """
+
+    saved = result.get("handoffs") or {}
+    return [
+        {"handoff": call, "result": saved.get(call.idempotency_key, {})}
+        for call in webex.calls[first:]
+    ]
+
+
+def check_handoff(turn: dict, handoffs: list[dict]) -> list[tuple[str, bool]]:
+    """For a turn with expected_handoff: exactly `count` handoffs, each one matching.
+
+    Every other turn must send none.
+    """
+
+    expected = turn.get("expected_handoff")
+    if not expected:
+        return [("no handoff", not handoffs)] if handoffs else []
+
+    matching = [
+        sent for sent in handoffs
+        if sent["handoff"].employee_id == expected["employee_id"]
+        and sent["handoff"].software == expected["software"]
+        and sent["result"].get("workflow") == expected["workflow"]
+        and sent["result"].get("status") == expected["status"]
+    ]
+    passed = len(handoffs) == expected["count"] and len(matching) == len(handoffs)
+    label = f"handoff {len(matching)}/{expected['count']} {expected['software']} {expected['status']}"
+    return [(label + ("" if passed else f" (sent {len(handoffs)})"), passed)]
+
+
+def describe_handoffs(handoffs: list[dict]) -> str:
+    """This turn's handoffs on one line, like "E001 Webex pending (WX-13acdeaf)"."""
+
+    return ", ".join(
+        f"{sent['handoff'].employee_id} {sent['handoff'].software} "
+        f"{sent['result'].get('status', '?')} ({sent['result'].get('request_id', '?')})"
+        for sent in handoffs
+    ) or "(none)"
+
+
 async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
-                   retriever: RecordingRetriever) -> dict:
+                   retriever: RecordingRetriever, webex: FakeWebexPort) -> dict:
     """Send one user message, then collect what happened in that turn."""
 
     first_call = len(recorder.calls)
     first_search = len(retriever.searches)
+    first_handoff = len(webex.calls)
     # Where the memory ended before this turn, to tell if a distil was kept or rejected.
     before = (await graph.aget_state(config)).values.get("distilled_upto", 0)
     # Only the new message is sent. The checkpointer adds the earlier ones.
@@ -248,13 +302,15 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
         for call in getattr(message, "tool_calls", None) or []
     ]
     answer = message_text(messages[-1])
+    handoffs = turn_handoffs(webex, first_handoff, result)
     return {
         "turn": turn,
         "plan": result["plan"],
         "denied": answer == REFUSAL,  # the authorize step sent the turn down the deny path
         "loadout": result["loadout"],
         "tool_calls": tool_calls,
-        "checks": check_turn(turn, result, tool_calls, answer),
+        "handoffs": handoffs,
+        "checks": check_turn(turn, result, tool_calls, answer) + check_handoff(turn, handoffs),
         "model_calls": recorder.calls[first_call:],
         "saved_messages": len(messages),
         "memory": result.get("memory") or {},
@@ -303,7 +359,8 @@ def was_rearmed(call: dict, calls: list) -> bool:
     """
 
     answer_calls = [c for c in calls if c["step"] == "model"]
-    return (call["step"] == "model" and not call["reply"].tool_calls
+    return (call["step"] == "model" and call["reply"] is not None
+            and not call["reply"].tool_calls
             and call is not answer_calls[-1])
 
 
@@ -432,6 +489,8 @@ def describe_fields(fields: dict) -> str:
 def describe_reply(reply) -> str:
     """What a model call returned, in full: a structured reply, tool calls, or an answer."""
 
+    if reply is None:
+        return "(no reply: the call failed)"
     if reply.tool_calls and reply.tool_calls[0]["name"] in OUTPUT_FORMATS:
         return describe_fields(reply.tool_calls[0]["args"])
     if reply.tool_calls:
@@ -491,6 +550,7 @@ def print_turn(number: int, outcome: dict) -> None:
     print(f"  memory:  {describe_memory(outcome)}")
     rearms = sum(was_rearmed(call, calls) for call in calls)
     print(f"  rearms:  {rearms}" + (" (an answer without a lookup was deleted and retried)" if rearms else ""))
+    print(f"  handoff: {describe_handoffs(outcome['handoffs'])}")
     print(f"  answer:  {one_line(answer, 90, count_dropped=False)}")
 
 
@@ -514,6 +574,9 @@ How to read this log:
     Code then drops every citation that points at nothing this conversation saw.
     CITES lists the answer's checked citations; CHECKLIST shows each item's status
     and citations (onboarding_status turns only). CITED in EVIDENCE counts these.
+  - HANDOFF lists the Webex requests this turn really sent (to a fake workflow).
+    A confirmed Webex request goes plan -> handoff -> END, so it makes only the
+    planner's model call.
   - MEMORY at the end of a turn shows the saved notes, when there are any.
   - Maya loads only 5 of the MCP server's 10 tools (the database reads). Where the
     dataset expects a document tool, retrieve's evidence stands in for it.
@@ -566,7 +629,10 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
         reply_label = "  Reply:"
         if was_rearmed(call, calls):
             reply_label = "  Reply (DELETED by rearm: no lookup happened; the user never saw it):"
-        lines += [reply_label, indent(describe_reply(call["reply"]), 4)]
+        reply_text = describe_reply(call["reply"])
+        if call.get("error"):
+            reply_text += f"\n{call['error']}"
+        lines += [reply_label, indent(reply_text, 4)]
 
     lines += [
         "",
@@ -576,6 +642,7 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
         f"CITES    {describe_citations(outcome['reply'])}",
         "CHECKLIST " + "\n  ".join(describe_checklist(outcome["reply"])),
         f"STATE    {outcome['saved_messages']} messages saved in thread {THREAD_ID}",
+        f"HANDOFF  {describe_handoffs(outcome['handoffs'])}",
         f"MEMORY   {describe_memory(outcome)}",
     ]
     if outcome["memory"]:
@@ -619,7 +686,7 @@ async def main(turn_count: int) -> None:
     with LOG_FILE.open("w") as log:
         log.write(log_header(len(tools)))
         for number, turn in enumerate(turns, start=1):
-            outcome = await run_turn(graph, config, recorder, turn, retriever)
+            outcome = await run_turn(graph, config, recorder, turn, retriever, webex)
             print_turn(number, outcome)
             log.write(log_turn(number, outcome, len(tools)))
             passed += turn_passed(outcome)
