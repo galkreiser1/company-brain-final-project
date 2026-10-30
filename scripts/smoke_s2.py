@@ -38,6 +38,7 @@ LOG_FILE = REPO_ROOT / "runs" / "smoke_s2.log"
 SESSION_ID = "S2-onboarding-maya"
 TURNS_TO_RUN = 3  # the default; --turns changes it
 MAX_TURNS = 12   # S2 has 12 turns
+HANDOFF_TURN = 10  # the turn that files the Webex request; replayed at the end
 
 # The conversation's ID. The checkpointer saves the state under it, so every turn sent
 # with the same thread_id continues the same conversation.
@@ -661,6 +662,21 @@ def turns_to_run() -> int:
     return parser.parse_args().turns
 
 
+async def replay_handoff_turn(graph, config: dict, turn: dict, webex: FakeWebexPort) -> bool:
+    """Send the handoff turn's message once more, on the same thread. Returns passed.
+
+    The checkpointer already holds the first send's key, so nothing new may reach the
+    workflow: the fake must still hold exactly one call, and the reply says pending.
+    """
+
+    result = await graph.ainvoke({"messages": [HumanMessage(turn["user"])]}, config=config)
+    answer = (result.get("reply") or {}).get("answer", "")
+    passed = len(webex.calls) == 1 and "pending" in answer.lower()
+    print(f"replay turn {HANDOFF_TURN}: {len(webex.calls)} handoff call(s) in total · "
+          f"{'PASS' if passed else 'FAIL'} · {one_line(answer, 90, count_dropped=False)}")
+    return passed
+
+
 async def main(turn_count: int) -> None:
     tools = await load_tools()
     retriever = RecordingRetriever(OpenSearchRetriever())
@@ -695,6 +711,9 @@ async def main(turn_count: int) -> None:
     print(f"\nTOTAL  {passed}/{len(turns)} turns pass · {len(recorder.calls)} model calls · "
           f"{input_tokens:,} input tokens")
     print(f"Full log: {LOG_FILE.relative_to(REPO_ROOT)}")
+
+    if turn_count >= HANDOFF_TURN:
+        await replay_handoff_turn(graph, config, turns[HANDOFF_TURN - 1], webex)
 
 
 if __name__ == "__main__":
