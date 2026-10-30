@@ -16,6 +16,14 @@ Lesson 10's finished agent (stage 3) on the 12-turn S2 conversation, compared wi
 
 Model answers vary between runs, so a rerun gives slightly different numbers.
 
+## Tools: database reads only
+
+Maya loads 5 of the MCP server's 10 tools: `get_employee`, `list_onboarding_tasks`, `check_asset_inventory`, `check_software_subscription` and `list_employee_tickets` (an allowlist in `maya/loadout.py`).
+
+- **The write tool** (`create_access_request`) is never loaded, so no fallback can expose it.
+- **The 4 document tools** (`search_hr_documents`, `search_knowledge_base`, `list_policies`, `get_policy`) are never loaded either. They return any document to anyone. Documents come only from Maya's own OpenSearch search, which filters by who is asking.
+- **Effect on the golden dataset:** S2 turns 2, 6 and 9 expect a document tool. Maya's search covers them instead, so the smoke test accepts retrieved evidence in place of those tools.
+
 ## Running
 
 From the project root (needs Lesson 10's MCP server running on 127.0.0.1:9877):

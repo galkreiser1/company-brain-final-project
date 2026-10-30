@@ -24,6 +24,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from maya.config import MCP_SERVER_URL, REPO_ROOT
 import maya.memory
 from maya.graph import REFUSAL, build_graph
+from maya.loadout import DOCUMENT_TOOLS, MAYA_READ_TOOLS
 from maya.memory import DISTIL_PROMPT, PLANNER_PROMPT, estimate_tokens, render_memory
 from maya.planning import ASSISTANT_PROMPT, IMPORTANT_POINTERS, message_text, render_transcript
 from maya.retrieval import OpenSearchRetriever
@@ -38,10 +39,6 @@ TURNS_TO_RUN = 3
 # with the same thread_id continues the same conversation.
 THREAD_ID = "smoke-s2"
 
-# LangGraph counts every step it runs in a turn and stops the turn with an error past
-# this limit. It stops a model that keeps asking for tools from looping forever.
-RECURSION_LIMIT = 12
-
 # Long prompts that calls repeat. The log shows ‹NAME› instead of the full text, so
 # what changes from call to call stands out.
 KNOWN_PROMPTS = {
@@ -55,15 +52,12 @@ KNOWN_PROMPTS = {
 # "calls" it to give its reply in that shape. These are those names, not real tools.
 OUTPUT_FORMATS = {"TurnPlan", "ConversationMemory"}
 
-# Tools that return document text. The retrieve step searches the same documents, so
-# its evidence can stand in for them (see covered_by_evidence).
-DOCUMENT_TOOLS = {"search_hr_documents", "search_knowledge_base", "get_policy"}
 
 # In the log, old answers and tool results are cut to this many characters.
 SHORT = 200
 
-# How many tools the MCP server has. Every step up to Step 7 showed all of them.
-TOOL_COUNT = 10
+# How many tools Maya loads (of the MCP server's ten). No loadout can be bigger.
+TOOL_COUNT = len(MAYA_READ_TOOLS)
 
 
 # LOADING ---------------------------------------------------------------------
@@ -151,14 +145,14 @@ def arg_check_passes(check: dict, tool_calls: list) -> bool:
     return False
 
 
-def covered_by_evidence(called: set, evidence: list, rearmed: bool) -> bool:
-    """True if the evidence stood in for a document tool.
+def covered_by_evidence(evidence: list) -> bool:
+    """True if the retrieve step found documents this turn.
 
-    Only when: the turn has evidence, rearm offered every tool, and the model still
-    called none. So it judged the documents enough, even with a second chance.
+    The dataset expects the MCP document tools, which Maya no longer loads: its own
+    search returns those documents instead, so its evidence stands in for them.
     """
 
-    return bool(evidence) and rearmed and not called
+    return bool(evidence)
 
 
 def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[tuple[str, bool]]:
@@ -166,7 +160,7 @@ def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[
 
     plan = result["plan"]
     called = {call["name"] for call in tool_calls}
-    by_evidence = covered_by_evidence(called, result.get("evidence"), result.get("rearmed"))
+    by_evidence = covered_by_evidence(result.get("evidence"))
     checks = []
 
     # "a|b" in the dataset means either intent is accepted.
@@ -179,10 +173,13 @@ def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[
     plan_wants = plan["needs_documents"] or plan["needs_records"]
     checks.append(("plan needs a lookup" if wants_tools else "plan needs no lookup",
                    plan_wants == wants_tools))
-    if wants_tools and by_evidence:
-        checks.append(("tools used (evidence instead, even after rearm)", True))
-    else:
-        checks.append(("tools used" if wants_tools else "no tools", bool(called) == wants_tools))
+    # A lookup is a tool call or a search that found documents.
+    looked_up = bool(called) or by_evidence
+    checks.append(("lookup done" if wants_tools else "no lookup", looked_up == wants_tools))
+
+    # Maya loads only its five read tools, so a loadout can never hold anything else.
+    loadout = result["loadout"]
+    checks.append(("only read tools loaded", set(loadout) <= set(MAYA_READ_TOOLS)))
 
     missing = [
         name for name in turn.get("expected_tools", [])
@@ -451,6 +448,8 @@ How to read this log:
   - ‹ASSISTANT_PROMPT›, ‹IMPORTANT_POINTERS›, ‹PLANNER_PROMPT› and ‹DISTIL_PROMPT›
     stand for those prompts' full text (see maya/planning.py and maya/memory.py).
   - MEMORY at the end of a turn shows the saved notes, when there are any.
+  - Maya loads only 5 of the MCP server's 10 tools (the database reads). Where the
+    dataset expects a document tool, retrieve's evidence stands in for it.
   - Old answers and tool results are cut to {short} characters.
 """
 
@@ -530,11 +529,10 @@ async def main() -> None:
             "caller_id": session["caller_id"],
             "user_group": session["caller_group"],
         },
-        "recursion_limit": RECURSION_LIMIT,
         "callbacks": [recorder],
     }
     turns = session["turns"][:TURNS_TO_RUN]
-    print(f"Smoke test: {SESSION_ID}, turns 1-{len(turns)} · {len(tools)} tools from MCP · "
+    print(f"Smoke test: {SESSION_ID}, turns 1-{len(turns)} · {len(tools)} tools from MCP, Maya loads {TOOL_COUNT} · "
           f"caller {session['caller_id']} ({session['caller_group']})")
 
     LOG_FILE.parent.mkdir(exist_ok=True)
