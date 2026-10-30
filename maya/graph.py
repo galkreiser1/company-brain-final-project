@@ -33,7 +33,7 @@ from langgraph.prebuilt import ToolNode
 
 from maya.config import DATA_DIR
 from maya.ingest import load_employee_ids
-from maya.loadout import WRITE_TOOLS, select_tools
+from maya.loadout import maya_tools, select_tools
 from maya.memory import (
     ConversationMemory,
     distiller_messages,
@@ -217,20 +217,13 @@ def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetri
     return {"evidence": [chunk.model_dump() for chunk in evidence]}
 
 
-def select(state: AgentState, all_tool_names: list[str]) -> dict:
-    """Step 6: turn the plan into this turn's loadout. No model call.
+def select(state: AgentState) -> dict:
+    """Step 6: turn the plan into this turn's loadout (select_tools). No model call.
 
-    select_tools() returns a list of tool names ([] means none), or None for topic
-    "other", which means every tool. Note: "every tool" includes the write tool.
     Also resets `rearmed` for the new turn.
     """
 
-    chosen = select_tools(ContextPlan(**state["plan"]))
-    if chosen is None:
-        loadout = all_tool_names
-    else:
-        loadout = chosen
-    return {"loadout": loadout, "rearmed": False}
+    return {"loadout": select_tools(ContextPlan(**state["plan"])), "rearmed": False}
 
 
 def model_with_tools(base_model, tools_by_name: dict, names: list[str]):
@@ -294,19 +287,14 @@ def route(state: AgentState) -> str:
 def rearm(state: AgentState, all_tool_names: list[str]) -> dict:
     """Step 9b (only when a lookup was missed): retry once with every read tool.
 
-    - Loadout: every read tool. The write tool stays only if it was already allowed
-      this turn, so a retry can never be what turns the write on.
+    - Loadout: all of Maya's tools (only read tools are ever loaded).
     - Deletes the answer the model just wrote without a lookup (the user never saw it).
     - Sets `rearmed`, so route() won't send this turn here a second time.
     """
 
-    allowed = [
-        name for name in all_tool_names
-        if name not in WRITE_TOOLS or name in state["loadout"]
-    ]
     unseen_answer = state["messages"][-1]
     return {
-        "loadout": allowed,
+        "loadout": all_tool_names,
         "rearmed": True,
         "messages": [RemoveMessage(id=unseen_answer.id)],  # delete by id, don't append
     }
@@ -314,18 +302,26 @@ def rearm(state: AgentState, all_tool_names: list[str]) -> dict:
 
 # WIRING ----------------------------------------------------------------------
 
+# LangGraph counts every step it runs in a turn and stops the turn with an error past
+# this limit. It stops a model that keeps asking for tools from looping forever.
+RECURSION_LIMIT = 12
+
+
 def build_graph(tools: list, retriever: EvidenceRetriever):
     """Create the models, then connect the steps into a graph.
 
+    `tools` can be everything the MCP server offers: only Maya's five read tools are
+    kept (maya_tools), so no step can ever see another one.
     `retriever` searches the documents (an OpenSearchRetriever, or a fake in tests).
 
     `partial(f, x=...)` makes a copy of f with x already filled in, so LangGraph can
     call each step with just the state.
     """
 
+    tools = maya_tools(tools)  # first, so everything below sees only these
     base_model = get_model()  # tools are attached per turn, in call_model
     tools_by_name = {tool.name: tool for tool in tools}
-    all_tool_names = sorted(tools_by_name)  # all ten, including the write tool
+    all_tool_names = [tool.name for tool in tools]
     # The planner must reply with a TurnPlan. include_raw=True returns a dict whose
     # "parsed" is None when the reply can't be read as one, instead of raising an error.
     planner = get_model().with_structured_output(TurnPlan, include_raw=True)
@@ -338,7 +334,7 @@ def build_graph(tools: list, retriever: EvidenceRetriever):
     graph.add_node("plan", partial(plan_turn, planner=planner, employee_ids=employee_ids))
     graph.add_node("deny", deny)
     graph.add_node("retrieve", partial(retrieve, retriever=retriever))
-    graph.add_node("select", partial(select, all_tool_names=all_tool_names))
+    graph.add_node("select", select)
     graph.add_node("model", partial(
         call_model, base_model=base_model, tools_by_name=tools_by_name,
     ))
@@ -367,4 +363,6 @@ def build_graph(tools: list, retriever: EvidenceRetriever):
 
     # The checkpointer saves the state per conversation (thread_id) between turns, so
     # each turn starts with the messages of all earlier turns.
-    return graph.compile(checkpointer=InMemorySaver())
+    # with_config sets the limit on every run, so callers don't have to remember it.
+    compiled = graph.compile(checkpointer=InMemorySaver())
+    return compiled.with_config(recursion_limit=RECURSION_LIMIT)
