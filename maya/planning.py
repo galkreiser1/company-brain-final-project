@@ -151,6 +151,14 @@ REQUIRED_COLLECTIONS: dict[str, list[str]] = {
 }
 
 
+def fallback_plan() -> TurnPlan:
+    """The plan used when the planner's answer can't be read: topic "other", documents
+    and records both needed, no subject. Needing both is the safe guess: it allows a
+    search and the read tools, never the write tool (which Maya doesn't load)."""
+
+    return TurnPlan(current_intent="other", needs_documents=True, needs_records=True)
+
+
 class ContextPlan(TurnPlan):
     """The planner's TurnPlan, plus two fields that code fills in (never the model)."""
 

@@ -49,6 +49,7 @@ from maya.planning import (
     TurnPlan,
     answer_messages,
     build_context_plan,
+    fallback_plan,
     respond_messages,
     message_text,
     recent_turns,
@@ -131,8 +132,7 @@ async def plan_turn(state: AgentState, planner, employee_ids: dict[str, str]) ->
     result = await planner.ainvoke(planner_messages(state))
     turn_plan = result["parsed"]
     if not turn_plan:
-        turn_plan = TurnPlan(current_intent="other", needs_documents=True,
-                             needs_records=True)
+        turn_plan = fallback_plan()
     plan = build_context_plan(turn_plan, employee_ids)
     return {"plan": plan.model_dump()}
 
