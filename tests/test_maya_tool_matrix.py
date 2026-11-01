@@ -24,7 +24,7 @@ from maya.loadout import (
 from maya.planning import REQUIRED_COLLECTIONS, TurnPlan, fallback_plan
 
 
-GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"  # same as smoke_s2.py
+GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"  # same as evals/run_maya_s2.py
 SESSION_ID = "S2-onboarding-maya"
 WRITE_TOOL = "create_access_request"
 

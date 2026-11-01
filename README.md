@@ -67,7 +67,8 @@ Maya never writes to a system. When the user confirms a Webex access request ("g
 From the project root (needs Lesson 10's MCP server running on 127.0.0.1:9877):
 
 ```
-python -m scripts.smoke_s2
+python -m evals.run_maya_s2            # all 12 S2 turns
+python -m evals.run_maya_s2 --turns 3  # a quick run
 ```
 
 `-m` makes Python import from the project root, so `maya` is found.
