@@ -42,8 +42,9 @@ MAX_TURNS = 12   # S2 has 12 turns
 HANDOFF_TURN = 10  # the turn that files the Webex request; replayed at the end
 
 # The conversation's ID. The checkpointer saves the state under it, so every turn sent
-# with the same thread_id continues the same conversation.
-THREAD_ID = "smoke-s2"
+# with the same thread_id continues the same conversation. It's the session's id, so a
+# saved run can be matched to its golden session.
+THREAD_ID = SESSION_ID
 
 # Long prompts that calls repeat. The log shows ‹NAME› instead of the full text, so
 # what changes from call to call stands out.
@@ -191,7 +192,9 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
         "loadout": result["loadout"],
         "tool_calls": tool_calls,
         "handoffs": handoffs,
-        "checks": check_turn(turn, result, tool_calls, answer) + check_handoff(turn, handoffs),
+        "checks": (check_turn(turn, result, tool_calls, answer) + check_handoff(turn, handoffs)
+                   + [("finished without error", True)]),
+        "error": None,
         "model_calls": recorder.calls[first_call:],
         "saved_messages": len(messages),
         "memory": result.get("memory") or {},
@@ -203,6 +206,36 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
         # The messages the memory doesn't cover yet: what the next check counts.
         "fresh": messages[result.get("distilled_upto", 0):],
     }
+
+
+async def run_turn_safely(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
+                          retriever: RecordingRetriever, webex: FakeWebexPort) -> dict:
+    """run_turn, but a crash becomes a failed turn instead of ending the run.
+
+    A crash on turn 6 (say, GraphRecursionError) must not hide turns 7-12. The next
+    turn runs on the same thread, from whatever state the checkpointer last saved.
+    """
+
+    first_call = len(recorder.calls)
+    try:
+        return await run_turn(graph, config, recorder, turn, retriever, webex)
+    except Exception as error:
+        return {
+            "turn": turn,
+            "error": f"{type(error).__name__}: {error}",
+            "answer": "",
+            "tool_calls": [],
+            "handoffs": [],
+            "checks": [("finished without error", False)],
+            "model_calls": recorder.calls[first_call:],  # the calls made before the crash
+        }
+
+
+def describe_error_turn(number: int, outcome: dict) -> str:
+    """A crashed turn, on two lines: for the terminal and the log."""
+
+    return (f"Turn {number}  FAIL  {one_line(outcome['turn']['user'], 70, count_dropped=False)}\n"
+            f"  ERROR  {outcome['error']}")
 
 
 # FORMATTING ------------------------------------------------------------------
@@ -468,7 +501,7 @@ How to read this log:
 def log_header(tool_count: int) -> str:
     started = datetime.now().strftime("%Y-%m-%d %H:%M")
     return (
-        f"Smoke test log · {started} · session {SESSION_ID} · thread {THREAD_ID}\n"
+        f"S2 runner log · {started} · session {SESSION_ID} · thread {THREAD_ID}\n"
         f"{tool_count} tools from {MCP_SERVER_URL}\n\n"
         + LOG_INTRO.format(short=SHORT)
     )
@@ -582,9 +615,13 @@ async def main(turn_count: int) -> None:
     with LOG_FILE.open("w") as log:
         log.write(log_header(len(tools)))
         for number, turn in enumerate(turns, start=1):
-            outcome = await run_turn(graph, config, recorder, turn, retriever, webex)
-            print_turn(number, outcome)
-            log.write(log_turn(number, outcome, len(tools)))
+            outcome = await run_turn_safely(graph, config, recorder, turn, retriever, webex)
+            if outcome["error"]:
+                print(describe_error_turn(number, outcome))
+                log.write("\n" + describe_error_turn(number, outcome) + "\n")
+            else:
+                print_turn(number, outcome)
+                log.write(log_turn(number, outcome, len(tools)))
             passed += turn_passed(outcome)
 
     input_tokens = sum(call["input_tokens"] for call in recorder.calls)
