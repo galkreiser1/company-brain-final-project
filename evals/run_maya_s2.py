@@ -16,8 +16,10 @@ The checks live in evals/s2_checks.py.
 import argparse
 import asyncio
 import json
+import sys
 import textwrap
 from datetime import datetime
+from pathlib import Path
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage
@@ -30,12 +32,14 @@ from maya.loadout import MAYA_READ_TOOLS
 from maya.ports import FakeWebexPort
 from maya.memory import DISTIL_PROMPT, PLANNER_PROMPT, estimate_tokens, render_memory
 from maya.planning import ASSISTANT_PROMPT, IMPORTANT_POINTERS, message_text, render_transcript
+from maya.respond import tool_result_ids
 from maya.retrieval import OpenSearchRetriever
 from evals.s2_checks import check_handoff, check_turn, turn_handoffs
 
 
 GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"
 LOG_FILE = REPO_ROOT / "runs" / "maya_s2.log"
+RUNS_DIR = REPO_ROOT / "runs"  # not committed: the records hold employee data
 SESSION_ID = "S2-onboarding-maya"
 TURNS_TO_RUN = 12  # the default: the whole session; --turns changes it
 MAX_TURNS = 12   # S2 has 12 turns
@@ -185,8 +189,13 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
     ]
     answer = message_text(messages[-1])
     handoffs = turn_handoffs(webex, first_handoff, result)
+    evidence = result.get("evidence") or []
     return {
         "turn": turn,
+        "answer": answer,
+        # What this turn looked at: the chunks it retrieved, the records its tools returned.
+        "source_ids": ([chunk["chunk_id"] for chunk in evidence]
+                       + tool_result_ids(messages[turn_start:])),
         "plan": result["plan"],
         "denied": answer == REFUSAL,  # the authorize step sent the turn down the deny path
         "loadout": result["loadout"],
@@ -564,6 +573,66 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+# THE RUN'S RECORD ------------------------------------------------------------
+
+def turn_record(number: int, outcome: dict) -> dict:
+    """One turn as plain JSON: what was asked, what Maya did, and how it was graded."""
+
+    turn = outcome["turn"]
+    calls = outcome["model_calls"]
+    return {
+        "turn": number,
+        "user": turn["user"],
+        "kind": turn.get("kind"),
+        "plan": outcome.get("plan"),
+        "answer": outcome["answer"],
+        "reply": outcome.get("reply"),
+        "checklist": (outcome.get("reply") or {}).get("checklist"),
+        "source_ids": outcome.get("source_ids", []),
+        "tool_calls": [{"name": call["name"], "args": call["args"]} for call in outcome["tool_calls"]],
+        "handoffs": [{"handoff": sent["handoff"].model_dump(), "result": sent["result"]}
+                     for sent in outcome["handoffs"]],
+        "error": outcome["error"],
+        "checks": [{"label": label, "passed": passed} for label, passed in outcome["checks"]],
+        "model_calls": len(calls),
+        "input_tokens": sum(call["input_tokens"] for call in calls),
+    }
+
+
+def failure_lines(records: list[dict], replay_passed: bool | None) -> list[str]:
+    """One line per failed turn, naming its failed checks, e.g.
+    "turn 6: expected tools (missing get_policy)". Plus the replay, if it failed."""
+
+    lines = []
+    for record in records:
+        failed = [check["label"] for check in record["checks"] if not check["passed"]]
+        if failed:
+            lines.append(f"turn {record['turn']}: {'; '.join(failed)}")
+    if replay_passed is False:
+        lines.append(f"replay turn {HANDOFF_TURN}: sent a second handoff, or didn't say pending")
+    return lines
+
+
+def save_run(records: list[dict], replay_passed: bool | None) -> Path:
+    """Write the whole run to runs/maya_s2_<YYYYmmdd-HHMMSS>.json. Returns its path."""
+
+    path = RUNS_DIR / f"maya_s2_{datetime.now():%Y%m%d-%H%M%S}.json"
+    run = {
+        "session": SESSION_ID,
+        "thread_id": THREAD_ID,
+        "turns": records,
+        "replay_turn_10_passed": replay_passed,  # None: the run didn't reach turn 10
+        "totals": {
+            "turns": len(records),
+            "turns_passed": sum(all(c["passed"] for c in r["checks"]) for r in records),
+            "model_calls": sum(r["model_calls"] for r in records),
+            "input_tokens": sum(r["input_tokens"] for r in records),
+        },
+    }
+    path.write_text(json.dumps(run, indent=2, default=str))  # default=str: e.g. a date
+    return path
+
+
 # MAIN ------------------------------------------------------------------------
 
 def turns_to_run() -> int:
@@ -582,7 +651,11 @@ async def replay_handoff_turn(graph, config: dict, turn: dict, webex: FakeWebexP
     workflow: the fake must still hold exactly one call, and the reply says pending.
     """
 
-    result = await graph.ainvoke({"messages": [HumanMessage(turn["user"])]}, config=config)
+    try:
+        result = await graph.ainvoke({"messages": [HumanMessage(turn["user"])]}, config=config)
+    except Exception as error:
+        print(f"replay turn {HANDOFF_TURN}: FAIL · {type(error).__name__}: {error}")
+        return False
     answer = (result.get("reply") or {}).get("answer", "")
     passed = len(webex.calls) == 1 and "pending" in answer.lower()
     print(f"replay turn {HANDOFF_TURN}: {len(webex.calls)} handoff call(s) in total · "
@@ -590,7 +663,9 @@ async def replay_handoff_turn(graph, config: dict, turn: dict, webex: FakeWebexP
     return passed
 
 
-async def main(turn_count: int) -> None:
+async def main(turn_count: int) -> int:
+    """Run the turns, save the record, and return the exit code: 1 if anything failed."""
+
     tools = await load_tools()
     retriever = RecordingRetriever(OpenSearchRetriever())
     webex = FakeWebexPort()  # records each handoff instead of reaching a real workflow
@@ -612,6 +687,7 @@ async def main(turn_count: int) -> None:
 
     LOG_FILE.parent.mkdir(exist_ok=True)
     passed = 0
+    records = []
     with LOG_FILE.open("w") as log:
         log.write(log_header(len(tools)))
         for number, turn in enumerate(turns, start=1):
@@ -623,15 +699,23 @@ async def main(turn_count: int) -> None:
                 print_turn(number, outcome)
                 log.write(log_turn(number, outcome, len(tools)))
             passed += turn_passed(outcome)
+            records.append(turn_record(number, outcome))
 
     input_tokens = sum(call["input_tokens"] for call in recorder.calls)
     print(f"\nTOTAL  {passed}/{len(turns)} turns pass · {len(recorder.calls)} model calls · "
           f"{input_tokens:,} input tokens")
     print(f"Full log: {LOG_FILE.relative_to(REPO_ROOT)}")
 
+    replay_passed = None
     if turn_count >= HANDOFF_TURN:
-        await replay_handoff_turn(graph, config, turns[HANDOFF_TURN - 1], webex)
+        replay_passed = await replay_handoff_turn(graph, config, turns[HANDOFF_TURN - 1], webex)
+
+    print(f"Run record: {save_run(records, replay_passed).relative_to(REPO_ROOT)}")
+    failures = failure_lines(records, replay_passed)
+    if failures:
+        print("\nFAILED\n  " + "\n  ".join(failures))
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main(turns_to_run()))
+    sys.exit(asyncio.run(main(turns_to_run())))

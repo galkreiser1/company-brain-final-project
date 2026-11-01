@@ -72,3 +72,5 @@ python -m evals.run_maya_s2 --turns 3  # a quick run
 ```
 
 `-m` makes Python import from the project root, so `maya` is found.
+
+Each run writes `runs/maya_s2_<date-time>.json` (one record per turn: answer, checklist, source IDs, tool calls, handoffs, error, checks) and a full log, `runs/maya_s2.log`. A crashed turn is recorded and the run goes on. The exit code is 1 if any turn or the turn-10 replay failed. `runs/` isn't committed: it holds employee data.
