@@ -224,3 +224,118 @@ def create_access_request(
         "status": "pending_approval",
         "created_at": created_at,
     }
+
+
+# --- Webex tools -------------------------------------------------------------
+# An approval for a NEW request is saved before that request exists, so it can't
+# point at an AR... id. It points at the Webex run key instead, e.g.
+# "webex-E001-S001" (person + system), and gets its own request_type.
+NEW_REQUEST_TYPE = "new_access_request"
+OPEN_APPROVAL_STATUSES = ("needed", "pending")
+DECISIONS = ("approved", "rejected")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def list_access_requests(employee_id: str) -> list[dict]:
+    """Return one employee's access requests (any status), oldest first."""
+    rows = _conn().execute(
+        "SELECT ar.request_id, ar.employee_id, ar.system_id, sys.system_name, "
+        "       ar.access_level, ar.status, ar.approver_id, ar.created_at, "
+        "       ar.decision_reason "
+        "FROM access_requests ar JOIN systems sys ON ar.system_id = sys.system_id "
+        "WHERE ar.employee_id = ? ORDER BY ar.created_at, ar.request_id",
+        (employee_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_approvals(employee_id: str) -> list[dict]:
+    """Return every approval about one employee, oldest first.
+
+    The approvals table has no employee column, so there are two ways to match:
+    a seed approval points at one of the employee's access requests (AR001), and
+    a new one points at a run key that contains the employee id (webex-E001-S001).
+    """
+    rows = _conn().execute(
+        "SELECT approval_id, request_type, request_id, approver_id, status, "
+        "       decision_reason, created_at "
+        "FROM approvals "
+        "WHERE request_id IN (SELECT request_id FROM access_requests WHERE employee_id = ?) "
+        "   OR request_id LIKE ? "
+        "ORDER BY created_at, approval_id",
+        (employee_id, f"%-{employee_id}-%"),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def request_approval(request_key: str, approver_id: str, reason: str) -> dict:
+    """WRITE: ask one person to approve a new access request (status 'needed').
+
+    Safe to call twice: if this run key already has an approval that isn't
+    rejected, that row is returned and nothing new is written. So a replay of
+    the same run can't create a second approval.
+    """
+    conn = _conn()
+    if conn.execute(
+        "SELECT 1 FROM employees WHERE employee_id = ?", (approver_id,)
+    ).fetchone() is None:
+        raise ValueError(f"No employee {approver_id!r} to approve.")
+
+    existing = conn.execute(
+        "SELECT * FROM approvals WHERE request_id = ? AND status != 'rejected' "
+        "ORDER BY created_at LIMIT 1",
+        (request_key,),
+    ).fetchone()
+    if existing is not None:
+        return dict(existing)
+
+    # Same id scheme as the seed (AP001...). The seed already has AP001-AP004.
+    last = conn.execute(
+        "SELECT approval_id FROM approvals ORDER BY approval_id DESC LIMIT 1"
+    ).fetchone()
+    approval_id = f"AP{int(last['approval_id'][2:]) + 1:03d}"
+
+    conn.execute(
+        "INSERT INTO approvals (approval_id, request_type, request_id, approver_id, "
+        " status, decision_reason, created_at) VALUES (?, ?, ?, ?, 'needed', ?, ?)",
+        (approval_id, NEW_REQUEST_TYPE, request_key, approver_id, reason, _now()),
+    )
+    conn.commit()
+    return dict(conn.execute(
+        "SELECT * FROM approvals WHERE approval_id = ?", (approval_id,)
+    ).fetchone())
+
+
+def record_approval_decision(
+    approval_id: str, approver_id: str, decision: str, reason: str = ""
+) -> dict:
+    """WRITE: save a person's decision on an open approval.
+
+    Only the approver named on the row may decide, and only once: a row that is
+    already approved or rejected can't be changed.
+    """
+    if decision not in DECISIONS:
+        raise ValueError(f"decision must be one of {DECISIONS}, got {decision!r}.")
+
+    conn = _conn()
+    row = conn.execute(
+        "SELECT approver_id, status FROM approvals WHERE approval_id = ?", (approval_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"No approval {approval_id!r}.")
+    if row["approver_id"] != approver_id:
+        raise ValueError(f"{approval_id} must be decided by {row['approver_id']}, not {approver_id}.")
+    if row["status"] not in OPEN_APPROVAL_STATUSES:
+        raise ValueError(f"{approval_id} is already {row['status']}.")
+
+    conn.execute(
+        "UPDATE approvals SET status = ?, decision_reason = ? WHERE approval_id = ?",
+        (decision, reason or None, approval_id),
+    )
+    conn.commit()
+    return dict(conn.execute(
+        "SELECT * FROM approvals WHERE approval_id = ?", (approval_id,)
+    ).fetchone())

@@ -20,6 +20,11 @@ schema is sent to the model on every call that has tools bound, so ten schemas i
 a standing input-token bill you pay whether or not the turn needs a single one of
 them. Lab 02 is about not paying it.
 
+Added here for Webex (14 tools in all):
+  SQLite   list_access_requests · list_approvals                <- reads
+  SQLite   request_approval · record_approval_decision          <- WRITES
+Maya loads only her five reads (maya/loadout.py), so none of these reach her.
+
 Run from the project root:
   python -m server.server        # serves at http://127.0.0.1:9877/mcp
 """
@@ -172,6 +177,66 @@ def create_access_request(
         business_justification: A short reason for the request.
     """
     return db.create_access_request(employee_id, software, business_justification)
+
+
+# --- Webex tools (new in this repo) ---------------------------------------------
+
+@mcp.tool()
+def list_access_requests(employee_id: str) -> list[dict]:
+    """List one employee's access requests (any status), with the system name.
+
+    Check this before filing anything: if a request for the same system already
+    exists, reuse it instead of filing a new one.
+
+    Args:
+        employee_id: The employee id, e.g. 'E010'.
+    """
+    return db.list_access_requests(employee_id)
+
+
+@mcp.tool()
+def list_approvals(employee_id: str) -> list[dict]:
+    """List every approval about one employee: who must approve, and the status.
+
+    Status is 'needed' or 'pending' (waiting), 'approved' or 'rejected'.
+
+    Args:
+        employee_id: The employee id, e.g. 'E010'.
+    """
+    return db.list_approvals(employee_id)
+
+
+@mcp.tool()
+def request_approval(request_key: str, approver_id: str, reason: str) -> dict:
+    """Ask a person to approve a new access request (status: needed).
+
+    This WRITES to the database. Calling it again with the same request_key
+    returns the existing approval instead of adding another.
+
+    Args:
+        request_key: The Webex run key, e.g. 'webex-E001-S001'.
+        approver_id: Who must approve, e.g. the employee's manager 'E018'.
+        reason: Why the approval is needed.
+    """
+    return db.request_approval(request_key, approver_id, reason)
+
+
+@mcp.tool()
+def record_approval_decision(
+    approval_id: str, approver_id: str, decision: str, reason: str = ""
+) -> dict:
+    """Record the named approver's decision on an open approval.
+
+    This WRITES to the database. Only the approver named on the row may decide,
+    and a decided approval can't be changed.
+
+    Args:
+        approval_id: The approval to decide, e.g. 'AP005'.
+        approver_id: Who is deciding; must match the approval's approver.
+        decision: 'approved' or 'rejected'.
+        reason: Optional note saved with the decision.
+    """
+    return db.record_approval_decision(approval_id, approver_id, decision, reason)
 
 
 if __name__ == "__main__":
