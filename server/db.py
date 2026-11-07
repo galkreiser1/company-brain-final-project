@@ -17,9 +17,11 @@ Lesson 9 shipped the first two reads and the write; the three middle reads are n
 here. They exist so the tool catalogue is big enough for tool *selection* to matter:
 ten schemas on every call is a real, measurable cost.
 
-The DB is built in memory from data/database/{schema,seed}.sql on first use, so
-there's no database file to create or clean up. Writes therefore live only for the
-life of the server process and reset on restart — fine for a demo, not a real store.
+The DB is a file, runs/novaops.db, built from data/novaops/database/{schema,seed}.sql
+the first time it's needed. (Lesson 10 kept it in memory, so every restart wiped
+it.) A file keeps writes across restarts, which Webex needs: a run paused for
+approval must find its rows after the program stops, and a replay must be able to
+check that it added none. `python -m server.reset_db` puts it back to the seed.
 """
 
 import functools
@@ -27,7 +29,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_DIR = Path(__file__).resolve().parent.parent / "data" / "novaops" / "database"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DB_DIR = PROJECT_ROOT / "data" / "novaops" / "database"
+# runs/ is git-ignored: this file holds employee data.
+DB_PATH = PROJECT_ROOT / "runs" / "novaops.db"
 
 # Only non-sensitive profile columns. A production version of this tool would also
 # filter by the caller's user group (HR-only fields exist) — that guardrail is the
@@ -38,19 +43,32 @@ EMPLOYEE_FIELDS = (
 )
 
 
-@functools.lru_cache(maxsize=1)
-def _conn() -> sqlite3.Connection:
-    """Build the in-memory NovaOps DB once from the shipped schema + seed SQL.
+def reset_database() -> None:
+    """Delete runs/novaops.db and rebuild it from the seed SQL.
 
-    check_same_thread=False because FastMCP runs sync tools in a worker thread,
-    which may not be the thread that first built this connection. One shared
-    connection also means create_access_request's writes are visible to later
-    reads. The agent calls tools one at a time, so no concurrent-write guarding
-    is needed here — a real multi-user server would need it."""
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    Stop the server first: it keeps its connection open, and would go on using
+    the deleted file."""
+    DB_PATH.parent.mkdir(exist_ok=True)
+    DB_PATH.unlink(missing_ok=True)
+    conn = sqlite3.connect(DB_PATH)
     conn.executescript((DB_DIR / "schema.sql").read_text(encoding="utf-8"))
     conn.executescript((DB_DIR / "seed.sql").read_text(encoding="utf-8"))
+    conn.commit()
+    conn.close()
+
+
+@functools.lru_cache(maxsize=1)
+def _conn() -> sqlite3.Connection:
+    """Open the database file once, building it from the seed if it's missing.
+
+    check_same_thread=False because FastMCP runs sync tools in a worker thread,
+    which may not be the thread that opened this connection. The agent calls
+    tools one at a time, so no concurrent-write guarding is needed here — a real
+    multi-user server would need it."""
+    if not DB_PATH.exists():
+        reset_database()
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     return conn
 
 
