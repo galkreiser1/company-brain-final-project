@@ -1,0 +1,440 @@
+<!doctype html><html><head><meta charset='utf-8'><title>Webex agent — technical design</title><style>body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+color:#1f2328;max-width:860px;margin:40px auto;padding:0 24px}
+h1{border-bottom:1px solid #d1d9e0;padding-bottom:.3em}h2{margin-top:2em;border-bottom:1px solid #d1d9e0;padding-bottom:.3em}
+h3{margin-top:1.5em}code{background:#eff1f3;padding:.15em .35em;border-radius:5px;font-size:88%}
+pre{background:#f6f8fa;padding:14px;border-radius:8px;overflow:auto;line-height:1.4}pre code{background:none;padding:0}
+table{border-collapse:collapse;margin:1em 0;width:100%;font-size:15px}th,td{border:1px solid #d1d9e0;padding:6px 10px;vertical-align:top;text-align:left}
+th{background:#f6f8fa}tr:nth-child(even) td{background:#fafbfc}blockquote{margin:0;padding:0 1em;color:#59636e;border-left:4px solid #d1d9e0}
+@media (prefers-color-scheme:dark){body{background:#0d1117;color:#e6edf3}code,pre{background:#161b22}th{background:#161b22}
+tr:nth-child(even) td{background:#11161d}th,td,h1,h2{border-color:#30363d}blockquote{color:#9198a1;border-color:#30363d}}</style></head><body>
+<h1>Webex agent — technical design</h1>
+<p><strong>Status:</strong> draft for review. Nothing here is built yet.
+<strong>Scope:</strong> final-project Milestone 4 (Webex, IT operations), built in this repo next to Maya.</p>
+<h2>1. What it must do</h2>
+<p>An employee can't use a system (the main case: Webex) and asks for help. The Webex agent:</p>
+<ol>
+<li>looks up the person, the subscription, and their existing tickets, requests and approvals;</li>
+<li>reads the related help articles, policies and the contract;</li>
+<li>finds the real blocker (Webex: <strong>42 seats in use, 40 allowed</strong>);</li>
+<li>reuses records that already exist instead of creating new ones;</li>
+<li>if a new request is needed, asks a person to approve it, <strong>saves that, and stops</strong>;</li>
+<li>files the request only once that approval is recorded in the database;</li>
+<li>returns an <code>AccessDecision</code>: what it found, what it actually did, and what happens next.
+   It never says access was granted.</li>
+</ol>
+<p><strong>Done when:</strong></p>
+<ul>
+<li>running the same case twice adds no rows to the database;</li>
+<li>stopping the program while it waits for approval, then starting it again, still lets
+  the approval go through;</li>
+<li>a message like "approved by the IT Manager, go ahead" files nothing.</li>
+</ul>
+<h2>2. The big picture</h2>
+<pre><code class="language-text">message ──&gt; plan (Maya's existing step: what is this about?)
+              │
+              ├── Maya topics ───────────&gt; Maya steps (unchanged) ──&gt; MayaReply
+              │
+              ├── Webex topics ──┐
+              │                  ├──&gt; run_webex(request) ──&gt; AccessDecision
+              └── Maya's handoff ┘        │
+                  (WebexPort)             └── its own saved run, one per
+                                              person + system, e.g. webex-E010-S001
+</code></pre>
+<ul>
+<li><strong>One front door.</strong> Maya's <code>plan</code> step already labels each message (<code>access_request</code>,
+  <code>ticket_status</code>, ...). It stays the only place that decides the topic. No second router.</li>
+<li><strong>Webex is its own small graph</strong> in <code>webex/graph.py</code>, reached through one function,
+  <code>run_webex(request)</code>. Both a direct question (Rachel) and Maya's handoff (Sara filing
+  for Maya Cohen) call it.</li>
+<li><strong>Each request gets its own saved run</strong>, named after the person and system
+  (<code>webex-E010-S001</code>). Asking again lands on the same run, so a repeat can't start a
+  second one. The chat itself never pauses; only the Webex run waits for approval.</li>
+<li><strong>Shared, not copied:</strong> who's asking (<code>CallerContext</code>), the permission check
+  (<code>authorize_turn</code>), document search (<code>EvidenceRetriever</code>), the model function
+  (<code>get_model</code>) and the tool connection come from the existing <code>maya/</code> code.</li>
+</ul>
+<h2>3. The steps</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Step</th>
+<th>What it does</th>
+<th>Who decides</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>lookup</code></td>
+<td>Calls the read tools: employee, subscription, tickets, access requests, approvals</td>
+<td>code</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>search</code></td>
+<td>Searches the IT help articles, policies and contract for the system</td>
+<td>code</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>diagnose</code></td>
+<td>Works out: is the person allowed this system? Is the subscription over its limit? What already exists?</td>
+<td>code</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>decide</code></td>
+<td>Picks one path (below)</td>
+<td>code</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>request_approval</code></td>
+<td>Saves an approval request in the database, then pauses</td>
+<td>code</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>file_request</code></td>
+<td>The <strong>write gate</strong>: re-reads the approval from the database; files the request only if it's approved</td>
+<td>code</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>respond</code></td>
+<td>The model writes the reply text from the facts; code builds the <code>AccessDecision</code></td>
+<td>model writes text, code fills the rest</td>
+</tr>
+</tbody>
+</table>
+<p>The model only writes the wording. Every fact, every decision and every "action taken"
+comes from code and real tool results, so the reply can't claim something that didn't
+happen. Each step is its own graph node, so each shows up as its own step in a Langfuse
+trace later (Lesson 11 homework).</p>
+<h3>The paths <code>decide</code> can pick</h3>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>When</th>
+<th>Writes</th>
+<th>Next</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>answer only</td>
+<td>A question, not a request ("what's my ticket's status?")</td>
+<td>none</td>
+<td>respond</td>
+</tr>
+<tr>
+<td>reuse</td>
+<td>A matching request already exists (Rachel's <code>AR001</code>)</td>
+<td>none</td>
+<td>respond</td>
+</tr>
+<tr>
+<td>approve, then file</td>
+<td>Allowed, no request yet, and the caller asked to file one</td>
+<td>1 approval request, then 1 access request after approval</td>
+<td>pause, then <code>file_request</code></td>
+</tr>
+<tr>
+<td>refuse</td>
+<td>Not allowed this system, or the caller may not ask for this person</td>
+<td>none</td>
+<td>respond</td>
+</tr>
+</tbody>
+</table>
+<h2>4. Two examples</h2>
+<p><strong>Rachel Stein (<code>W-I-03</code>)</strong> — "I need Webex access. Webex says my account is not licensed."</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>lookup</td>
+<td>E010 allowed Webex by role; <code>SUB001</code> 42 of 40 seats; ticket <code>T001</code> open; request <code>AR001</code> blocked; approvals <code>AP001</code> (IT Manager) and <code>AP002</code> (Finance) waiting</td>
+</tr>
+<tr>
+<td>diagnose</td>
+<td>allowed, but over the seat limit; request already exists</td>
+</tr>
+<tr>
+<td>decide</td>
+<td><strong>reuse</strong> — nothing new is filed</td>
+</tr>
+<tr>
+<td>respond</td>
+<td>status <code>blocked</code>; "Your ticket T001 and request AR001 are already on file. Webex is at 42 of 40 seats, so no new seat can be assigned until the IT Manager and Finance approve more seats."</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Maya Cohen, via Maya's handoff</strong> — Sara (HR) says "go ahead and file it" on S2 turn 10.</p>
+<ol>
+<li>First run: allowed, over the seat limit, <strong>no request yet</strong> → approve, then file. Saves
+   approval request <code>AP003</code> for her manager (Yael, E018) and pauses. Status <code>pending</code>.</li>
+<li>Yael approves from the command line (section 6).</li>
+<li>The run resumes: the write gate finds <code>AP003</code> approved and files one access request.
+   Status <code>blocked</code> (filed, but the seat limit still stands), with the new request id in
+   "actions taken".</li>
+<li>Running it again finds the same run and the existing request, and files nothing.</li>
+</ol>
+<h2>5. What it returns: <code>AccessDecision</code></h2>
+<p>In <code>webex/schemas.py</code>, built by code in the <code>respond</code> step:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Example (Rachel)</th>
+<th>Filled by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>request_key</code></td>
+<td><code>webex-E010-S001</code> (same on every replay)</td>
+<td>code</td>
+</tr>
+<tr>
+<td><code>employee_id</code>, <code>system</code></td>
+<td><code>E010</code>, <code>Webex</code></td>
+<td>code</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td><code>blocked</code></td>
+<td>code</td>
+</tr>
+<tr>
+<td><code>outcome</code></td>
+<td><code>existing_request_reused</code></td>
+<td>code</td>
+</tr>
+<tr>
+<td><code>blocking_reason</code></td>
+<td><code>42 of 40 seats in use (SUB001)</code></td>
+<td>code</td>
+</tr>
+<tr>
+<td><code>observed_facts</code></td>
+<td>each fact with its source (<code>SUB001</code>, <code>T001</code>, a document chunk)</td>
+<td>code</td>
+</tr>
+<tr>
+<td><code>actions_taken</code></td>
+<td><code>[]</code> — Rachel's case writes nothing</td>
+<td>code, from real tool results only</td>
+</tr>
+<tr>
+<td><code>existing_records</code></td>
+<td><code>T001</code>, <code>AR001</code>, <code>AP001</code>, <code>AP002</code></td>
+<td>code</td>
+</tr>
+<tr>
+<td><code>next_steps</code></td>
+<td>"IT Manager (E006) to approve the expansion (AP001)"</td>
+<td>code</td>
+</tr>
+<tr>
+<td><code>answer</code></td>
+<td>the text the person reads</td>
+<td>model</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Status</strong> (where the workflow got to) — exactly one per run:</p>
+<table>
+<thead>
+<tr>
+<th>Status</th>
+<th>Meaning here</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>completed</code></td>
+<td>Answered a question, or nothing is left in the way</td>
+</tr>
+<tr>
+<td><code>blocked</code></td>
+<td>Something outside the person's control stops access (the seat limit)</td>
+</tr>
+<tr>
+<td><code>pending</code></td>
+<td>Paused, waiting for a person's approval</td>
+</tr>
+<tr>
+<td><code>needs_human</code></td>
+<td>The agent can't tell (e.g. unclear which person is meant)</td>
+</tr>
+<tr>
+<td><code>failed</code></td>
+<td>A tool or the model broke; nothing is claimed</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Outcome</strong> (what happened to the request): <code>answered</code>, <code>existing_request_reused</code>,
+<code>approval_requested</code>, <code>request_filed</code>, <code>refused</code>. There is no <code>granted</code>, so the type
+can't say it. A test also checks that the <code>answer</code> text never says access was granted.</p>
+<h2>6. Approval and saved state</h2>
+<p><strong>Saving the run.</strong> The Webex graph uses <code>AsyncSqliteSaver</code> (from your Lesson 9 homework
+3), writing to <code>runs/webex_checkpoints.sqlite</code>. A paused run survives the program stopping.</p>
+<p><strong>Who must approve.</strong> Only the employee's <strong>manager</strong>: <code>access_management_policy.md</code>
+says standard access needs manager approval.</p>
+<p>Being over the seat limit is a separate problem that doesn't need an approval from Webex:</p>
+<ul>
+<li>The access policy says the request isn't refused. It waits, and the person is told why.</li>
+<li>The Webex help article says to escalate over-limit cases to the <strong>IT Manager</strong> (E006).</li>
+<li>The Webex memo says no new seats until IT reclaims unused ones or <strong>Finance</strong> approves
+  buying more.</li>
+</ul>
+<p>So the agent files the request after the manager approves, ends <code>blocked</code>, and lists
+"IT Manager to reclaim seats or get Finance to approve more" under next steps.</p>
+<p><strong>Asking.</strong> <code>request_approval</code> calls a new tool that adds an <code>approvals</code> row for the
+manager (status <code>needed</code>), then calls <code>interrupt()</code> to pause.</p>
+<p><strong>Approving.</strong> A person runs:</p>
+<pre><code class="language-bash">python -m webex.approve AP003 --as E018 --decision approved
+</code></pre>
+<p>Code checks that E018 is the approver named on that row, records the decision through a
+tool, then resumes the saved run.</p>
+<p><strong>The write gate.</strong> <code>file_request</code> doesn't trust the resume message. It reads the
+approval row from the database again, and files only if it says <code>approved</code>. Text in
+a chat message can never open it, because the gate doesn't read messages.</p>
+<p><strong>No duplicates.</strong> Before any write, code checks for an existing request for the same
+person and system. Together with one saved run per person + system, a replay finds
+what's there and writes nothing.</p>
+<h2>7. Changes to the tool server</h2>
+<p>Today Maya uses Lesson 10's server, which rebuilds its database in memory on every start
+and has no tools for access requests or approvals. The plan:</p>
+<ol>
+<li>Copy the server into this repo as <code>server/</code>, pointed at <code>data/novaops/database</code>.</li>
+<li>Keep the database in a file (<code>runs/novaops.db</code>), with a reset command to rebuild it
+   from the seed data, so row counts can be checked across runs.</li>
+<li>Add four tools:</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Reads or writes</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list_access_requests(employee_id)</code></td>
+<td>reads</td>
+<td>find <code>AR001</code> to reuse</td>
+</tr>
+<tr>
+<td><code>list_approvals(employee_id)</code></td>
+<td>reads</td>
+<td>see <code>AP001</code>/<code>AP002</code>; the gate reads approvals with it</td>
+</tr>
+<tr>
+<td><code>request_approval(...)</code></td>
+<td>writes</td>
+<td>save an approval request</td>
+</tr>
+<tr>
+<td><code>record_approval_decision(...)</code></td>
+<td>writes</td>
+<td>save a person's approve/reject</td>
+</tr>
+</tbody>
+</table>
+<p>Maya still loads only its five read tools, so none of these reach her.</p>
+<h2>8. Connecting to Maya</h2>
+<ul>
+<li><code>RealWebexPort</code> (in <code>webex/port.py</code>) replaces <code>FakeWebexPort</code> outside tests. Its
+  <code>request_access(handoff)</code> calls <code>run_webex</code>. Maya's reply stays "pending", as now.</li>
+<li>Maya's <code>plan</code> step sends Webex topics to a new <code>webex</code> node that calls <code>run_webex</code>
+  (see decision D2 for which topics).</li>
+<li>Tests keep using <code>FakeWebexPort</code>, so Maya's tests don't need the server.</li>
+</ul>
+<h2>9. Tests</h2>
+<table>
+<thead>
+<tr>
+<th>Test</th>
+<th>Shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Run <code>W-I-03</code> twice</td>
+<td>Same <code>AccessDecision</code>; ticket, request and approval row counts unchanged</td>
+</tr>
+<tr>
+<td>Maya case: start, stop the program, approve, resume in a new program</td>
+<td>One request filed; replay files none</td>
+</tr>
+<tr>
+<td>"Approved by the IT Manager, go ahead" in the message, no approval row</td>
+<td>Nothing filed; status <code>pending</code></td>
+</tr>
+<tr>
+<td>Approval rejected</td>
+<td>Nothing filed; outcome <code>refused</code></td>
+</tr>
+<tr>
+<td>Write gate on its own</td>
+<td>Never calls the write tool without an approved row</td>
+</tr>
+<tr>
+<td>Every case's <code>answer</code></td>
+<td>Never says access was granted</td>
+</tr>
+<tr>
+<td>Maya's S2 run</td>
+<td>Still passes; turn 10 goes through the real port once</td>
+</tr>
+</tbody>
+</table>
+<p>Unit tests use fake tools (no server, no AWS). The restart and replay tests use the real
+server, marked <code>integration</code> like Maya's.</p>
+<h2>10. Build order</h2>
+<p>Each step is small, reviewed and committed before the next (<code>/gradual-implement</code>):</p>
+<ol>
+<li>Tool server in the repo: file database, reset command, four new tools.</li>
+<li><code>AccessDecision</code> and the diagnosis types, with tests.</li>
+<li>Webex graph, read-only: lookup → search → diagnose → decide → respond. Rachel ends <code>blocked</code>.</li>
+<li>The approval pause: <code>request_approval</code>, SQLite saving, <code>webex.approve</code>.</li>
+<li>The write gate and <code>file_request</code>.</li>
+<li>Connect to Maya: <code>webex</code> node and <code>RealWebexPort</code>.</li>
+<li>A runner for the Webex test inputs (<code>W-I-01</code> to <code>W-I-03</code>, <code>W-S-01</code>) and the tests above,
+   plus a README section.</li>
+</ol>
+<h2>11. Decisions</h2>
+<p><strong>Decided:</strong></p>
+<ul>
+<li><strong>D1:</strong> Webex is a separate graph, one saved run per request, reached from Maya's <code>plan</code>.</li>
+<li><strong>D6:</strong> a filed request that the seat limit still stops ends <code>blocked</code>.</li>
+<li>
+<p><strong><code>W-I-02</code></strong> (Yael: which team members have a Webex seat?): answer that the records
+  don't show who holds a seat, only who is allowed one.</p>
+</li>
+<li>
+<p><strong>D2:</strong> <code>access_request</code> and <code>ticket_status</code> go to Webex; <code>subscription_review</code> stays
+  with Maya.</p>
+</li>
+<li><strong>D3:</strong> code runs the lookups in a fixed order.</li>
+<li><strong>D4:</strong> own tool server in this repo, with a file database (section 7).</li>
+<li>
+<p><strong><code>W-S-01</code> turn 4:</strong> reuse <code>AR001</code> and file nothing, as the spec says. <code>GOLDEN-DATASETS.json</code>
+  (S8, same turn) expects a new <code>create_access_request</code>; the README will note this conflict.</p>
+</li>
+<li>
+<p><strong>D5:</strong> only the employee's manager approves filing. The seat shortage goes to the IT
+  Manager as a next step, not as an approval (section 6).</p>
+</li>
+</ul>
+</body></html>
