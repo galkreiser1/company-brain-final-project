@@ -34,6 +34,9 @@ DB_DIR = PROJECT_ROOT / "data" / "novaops" / "database"
 # runs/ is git-ignored: this file holds employee data.
 DB_PATH = PROJECT_ROOT / "runs" / "novaops.db"
 
+# The statuses create_access_request may file a request with.
+FILED_STATUSES = ("pending_approval", "blocked", "approved")
+
 # Only non-sensitive profile columns. A production version of this tool would also
 # filter by the caller's user group (HR-only fields exist) — that guardrail is the
 # subject of the homework, not this lab.
@@ -175,14 +178,20 @@ def create_access_request(
     software: str,
     business_justification: str,
     access_level: str = "standard_user",
+    status: str = "pending_approval",
+    approver_id: str | None = None,
+    decision_reason: str | None = None,
 ) -> dict:
-    """File a new access request for an employee to a system; status pending_approval.
+    """File a new access request for an employee to a system.
 
-    The lab's one WRITE tool. It resolves the software name to a system id, inserts
-    a row into access_requests, and returns the created record. It deliberately does
-    NOT decide the request — approval is a separate human step, which is exactly the
-    gate Lesson 9 builds on top of this tool.
+    It resolves the software name to a system id, inserts a row into
+    access_requests, and returns the created record. By default (Lesson 10's
+    behaviour) the row waits as pending_approval with no approver. Webex files only
+    after a recorded approval, so it passes the status (blocked or approved), the
+    approver and the reason, e.g. "42 of 40 seats in use (SUB001)".
     """
+    if status not in FILED_STATUSES:
+        raise ValueError(f"status must be one of {FILED_STATUSES}, got {status!r}.")
     conn = _conn()
 
     if conn.execute(
@@ -211,9 +220,9 @@ def create_access_request(
         "INSERT INTO access_requests "
         "(request_id, employee_id, system_id, access_level, business_justification, "
         " status, approver_id, created_at, decision_reason) "
-        "VALUES (?, ?, ?, ?, ?, 'pending_approval', NULL, ?, NULL)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (request_id, employee_id, system["system_id"], access_level,
-         business_justification, created_at),
+         business_justification, status, approver_id, created_at, decision_reason),
     )
     conn.commit()
     return {
@@ -222,7 +231,9 @@ def create_access_request(
         "system_id": system["system_id"],
         "system_name": system["system_name"],
         "access_level": access_level,
-        "status": "pending_approval",
+        "status": status,
+        "approver_id": approver_id,
+        "decision_reason": decision_reason,
         "created_at": created_at,
     }
 

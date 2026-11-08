@@ -16,7 +16,8 @@ from maya.schemas import CallerContext, Evidence
 from server import db
 from webex import graph as webex_graph
 from webex.graph import (
-    CHECKPOINT_SERDE, build_graph, decide, diagnose, lookup, open_checkpointer, run_config,
+    CHECKPOINT_SERDE, build_graph, decide, diagnose, file_request, lookup, open_checkpointer,
+    run_config,
     run_webex,
 )
 from webex.schemas import WebexRequest
@@ -28,10 +29,15 @@ RACHEL_GREEN = CallerContext(caller_id="E009", user_group="UG_REGULAR")  # a col
 
 
 class DbToolbox:
-    """Calls server/db.py's functions in place of the MCP server."""
+    """Calls server/db.py's functions in place of the MCP server, and records
+    which tools were called, in order."""
+
+    def __init__(self):
+        self.calls = []
 
     async def call(self, name: str, **args) -> list:
         assert name in WEBEX_TOOLS
+        self.calls.append(name)
         result = getattr(db, name)(**args)
         return result if isinstance(result, list) else [result]
 
@@ -238,7 +244,7 @@ def test_the_approval_survives_a_restart(tmp_path, monkeypatch):
     assert asyncio.run(first_program()).status == "pending"
     decision, still_waiting = asyncio.run(second_program())
     assert not still_waiting
-    assert decision.next_steps[0] == "File the access request (not built yet)"
+    assert decision.outcome == "request_filed"
     assert len(db.list_approvals("E001")) == 1
 
 
@@ -254,3 +260,89 @@ def test_a_tool_error_is_raised_not_read_as_empty():
 
     with pytest.raises(ToolError, match="boom"):
         asyncio.run(McpToolbox([RefusingTool()]).call("list_approvals", employee_id="E001"))
+
+
+
+# THE WRITE GATE --------------------------------------------------------------------
+
+def filed_rows() -> list[str]:
+    return [r["request_id"] for r in db.list_access_requests("E001") if r["system_id"] == "S001"]
+
+
+def test_the_gate_never_files_without_an_approved_row():
+    """The state claims "approved", but the database row is still "needed"."""
+    async def scenario():
+        graph = new_graph()
+        await run_webex(graph, DbToolbox(), FILE_FOR_MAYA)
+        state = (await graph.aget_state(run_config(MAYA_KEY))).values
+        state["approval"] = {**state["approval"], "status": "approved"}  # a lie
+        toolbox = DbToolbox()
+        return await file_request(state, toolbox), toolbox.calls
+
+    update, calls = asyncio.run(scenario())
+    assert "create_access_request" not in calls
+    assert "filed" not in update
+    assert filed_rows() == []
+
+
+def test_approve_then_resume_files_exactly_one_blocked_request():
+    async def scenario():
+        graph = new_graph()
+        await run_webex(graph, DbToolbox(), FILE_FOR_MAYA)
+        db.record_approval_decision("AP005", "E018", "approved")
+        state = await graph.ainvoke(Command(resume="approved"), run_config(MAYA_KEY))
+        return state["decision"]
+
+    decision = asyncio.run(scenario())
+    assert (decision.status, decision.outcome) == ("blocked", "request_filed")
+    assert [a.record_id for a in decision.actions_taken] == ["AP005", "AR005"]
+    assert filed_rows() == ["AR005"]
+    [row] = [r for r in db.list_access_requests("E001") if r["request_id"] == "AR005"]
+    assert (row["status"], row["approver_id"]) == ("blocked", "E018")
+    assert row["decision_reason"] == "42 of 40 seats in use (SUB001)"
+
+
+def test_asking_again_after_filing_reuses_it():
+    async def scenario():
+        graph = new_graph()
+        await run_webex(graph, DbToolbox(), FILE_FOR_MAYA)
+        db.record_approval_decision("AP005", "E018", "approved")
+        await graph.ainvoke(Command(resume="approved"), run_config(MAYA_KEY))
+        return await run_webex(graph, DbToolbox(), FILE_FOR_MAYA)
+
+    decision = asyncio.run(scenario())
+    assert (decision.status, decision.outcome) == ("blocked", "existing_request_reused")
+    assert filed_rows() == ["AR005"]
+    assert len(db.list_approvals("E001")) == 1
+
+
+def test_stopped_after_approval_files_once_when_asked_again():
+    """Approved, but the run was never resumed: asking again files it, once."""
+    async def scenario():
+        graph = new_graph()
+        await run_webex(graph, DbToolbox(), FILE_FOR_MAYA)
+        db.record_approval_decision("AP005", "E018", "approved")
+        first = await run_webex(graph, DbToolbox(), FILE_FOR_MAYA)
+        second = await run_webex(graph, DbToolbox(), FILE_FOR_MAYA)
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert first.outcome == "request_filed"
+    assert second.outcome == "existing_request_reused"
+    assert filed_rows() == ["AR005"]
+
+
+def test_after_a_rejection_asking_again_asks_again():
+    """Decision D-b: re-asking is allowed, so a new approval is requested."""
+    async def scenario():
+        graph = new_graph()
+        await run_webex(graph, DbToolbox(), FILE_FOR_MAYA)
+        db.record_approval_decision("AP005", "E018", "rejected")
+        await graph.ainvoke(Command(resume="rejected"), run_config(MAYA_KEY))
+        return await run_webex(graph, DbToolbox(), FILE_FOR_MAYA)
+
+    decision = asyncio.run(scenario())
+    assert (decision.status, decision.outcome) == ("pending", "approval_requested")
+    assert [a.record_id for a in decision.actions_taken] == ["AP006"]
+    assert [a["status"] for a in db.list_approvals("E001")] == ["rejected", "needed"]
+    assert filed_rows() == []

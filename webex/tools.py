@@ -20,9 +20,9 @@ WEBEX_READ_TOOLS = (
     "list_access_requests",
     "list_approvals",
 )
-# Writes to approvals only. The graph asks (request_approval); the approve command
-# records a person's decision. Filing (create_access_request) comes with the write gate.
-WEBEX_WRITE_TOOLS = ("request_approval", "record_approval_decision")
+# The graph asks (request_approval) and files (create_access_request, only from the
+# write gate, file_request); the approve command records a decision.
+WEBEX_WRITE_TOOLS = ("request_approval", "record_approval_decision", "create_access_request")
 WEBEX_TOOLS = WEBEX_READ_TOOLS + WEBEX_WRITE_TOOLS
 
 

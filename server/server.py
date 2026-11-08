@@ -163,20 +163,31 @@ def list_employee_tickets(employee_id: str, status: str = "") -> list[dict]:
 
 @mcp.tool()
 def create_access_request(
-    employee_id: str, software: str, business_justification: str
+    employee_id: str,
+    software: str,
+    business_justification: str,
+    status: str = "pending_approval",
+    approver_id: str | None = None,
+    decision_reason: str | None = None,
 ) -> dict:
-    """File an access request for an employee to a system (status: pending_approval).
+    """File an access request for an employee to a system.
 
     This WRITES to the database. Use it only after confirming who the employee is
-    and that access is warranted. The request is created pending a human approval
-    decision — it does not grant access on its own.
+    and that access is warranted. It does not grant access on its own.
 
     Args:
         employee_id: The employee id the access is for, e.g. 'E001'.
         software: The software or system to request, e.g. 'Webex'.
         business_justification: A short reason for the request.
+        status: 'pending_approval' (default: waits for a decision), or, once an
+            approval is recorded, 'blocked' (e.g. no free seat) or 'approved'.
+        approver_id: Who approved it, if anyone, e.g. 'E018'.
+        decision_reason: Why it has this status, e.g. '42 of 40 seats in use'.
     """
-    return db.create_access_request(employee_id, software, business_justification)
+    return db.create_access_request(
+        employee_id, software, business_justification,
+        status=status, approver_id=approver_id, decision_reason=decision_reason,
+    )
 
 
 # --- Webex tools (new in this repo) ---------------------------------------------

@@ -79,7 +79,7 @@ def next_steps(diagnosis: Diagnosis, records: dict) -> list[str]:
     return steps
 
 
-def approval_result(approval: dict, diagnosis: Diagnosis) -> tuple:
+def approval_result(approval: dict, diagnosis: Diagnosis, filed: dict | None) -> tuple:
     """(status, outcome, next_steps) for the approve-then-file path."""
     approval_id, approver = approval["approval_id"], approval["approver_id"]
     if approval["status"] in OPEN_APPROVAL_STATUSES:
@@ -88,26 +88,39 @@ def approval_result(approval: dict, diagnosis: Diagnosis) -> tuple:
         return "pending", "approval_requested", steps
     if approval["status"] == "rejected":
         return "completed", "refused", []
-    # Approved. Filing the request is the next build step (the write gate).
-    return "pending", "approval_requested", ["File the access request (not built yet)"]
+    if filed:
+        # Filed, but a full subscription still stops it (decision D6).
+        return ("blocked" if diagnosis.over_seat_limit else "completed"), "request_filed", []
+    # Approved, but the write gate didn't file (it re-read the row and it wasn't).
+    return "pending", "approval_requested", ["File the access request"]
 
 
 def approval_action(approval: dict) -> ActionTaken:
     return ActionTaken(
         tool="request_approval", record_id=approval["approval_id"],
-        summary=f"Asked {approval['approver_id']} to approve {approval['request_id']}",
+        # The row's own reason, not its request_id: for a new request that's the run key.
+        summary=f"Asked {approval['approver_id']} to approve in {approval['approval_id']}: "
+                f"{approval['decision_reason']}",
+    )
+
+
+def filed_action(filed: dict) -> ActionTaken:
+    return ActionTaken(
+        tool="create_access_request", record_id=filed["request_id"],
+        summary=f"Filed request {filed['request_id']}: {filed['system_name']} access for "
+                f"{filed['employee_id']} (status {filed['status']})",
     )
 
 
 def build_decision(request: WebexRequest, path: str, diagnosis: Diagnosis, records: dict,
                    evidence: list[Evidence], request_key: str,
-                   approval: dict | None = None) -> AccessDecision:
+                   approval: dict | None = None, filed: dict | None = None) -> AccessDecision:
     """The full AccessDecision, with a placeholder answer the model then replaces."""
     steps, actions = next_steps(diagnosis, records), []
     reason = diagnosis.seat_reason if diagnosis.over_seat_limit else None
     if path == "approve_then_file":
-        status, outcome, steps = approval_result(approval, diagnosis)
-        actions = [approval_action(approval)]
+        status, outcome, steps = approval_result(approval, diagnosis, filed)
+        actions = [approval_action(approval)] + ([filed_action(filed)] if filed else [])
         if reason:
             steps.append(SEAT_NEXT_STEP)  # filing won't free a seat
     elif path == "refuse":
@@ -133,13 +146,16 @@ WRITER_PROMPT = (
     "You write the reply for NovaOps IT support. You get the caller's message and a "
     "decision as JSON. Write 2-4 plain sentences to the caller, using only the facts, "
     "record ids and next steps in the JSON. Never say access was granted or a seat was "
-    "assigned. Don't promise anything that isn't in next_steps."
+    "assigned. Don't promise anything that isn't in next_steps. Name records only by "
+    "their ids (e.g. AR005, AP005, T001). Copy numbers and the blocking_reason exactly "
+    "as written; don't reword them."
 )
 
 
 async def write_answer(answer_model, request: WebexRequest, decision: AccessDecision) -> str:
     """Ask the model for the reply text. The decision it reads is already final."""
-    facts = decision.model_dump(exclude={"answer"})
+    # Without the run key: it's internal, and the model kept calling the request by it.
+    facts = decision.model_dump(exclude={"answer", "request_key"})
     reply = await answer_model.ainvoke([
         SystemMessage(WRITER_PROMPT),
         HumanMessage(f"Message: {request.message}\n\nDecision:\n{json.dumps(facts, indent=1)}"),

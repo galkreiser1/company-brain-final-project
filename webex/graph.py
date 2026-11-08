@@ -8,6 +8,8 @@ The steps (docs/webex-design.md, section 3), each its own graph node:
   request_approval -> (approve_then_file only) saves an approval for the manager
   respond  -> code builds the AccessDecision; a model writes only its `answer`
   wait     -> pauses until resumed, then re-reads the approval from the database
+  file_request -> the write gate: files the access request only if the approval
+              row in the database says approved
 
 Each run is saved under its request key (webex-E001-S001) in
 runs/webex_checkpoints.sqlite, so a paused run survives the program stopping.
@@ -61,6 +63,7 @@ class WebexState(TypedDict, total=False):
     diagnosis: Diagnosis
     path: DecisionPath
     approval: dict | None   # the approvals row this run asked for
+    filed: dict | None      # the access request file_request created
     decision: AccessDecision
 
 
@@ -201,6 +204,40 @@ async def wait_for_approval(state: WebexState, toolbox: Toolbox) -> dict:
     return {"approval": fresh}
 
 
+# 4c. THE WRITE GATE --------------------------------------------------------------
+
+async def file_request(state: WebexState, toolbox: Toolbox) -> dict:
+    """File the access request, but only if the approval row says approved now.
+
+    It reads the row again itself instead of trusting the state, so nothing that
+    resumed the run, and no message text, can open the gate."""
+    request, diagnosis = state["request"], state["diagnosis"]
+    approval_id = state["approval"]["approval_id"]
+    rows = await toolbox.call("list_approvals", employee_id=request.employee_id)
+    [approval] = [row for row in rows if row["approval_id"] == approval_id]
+    if approval["status"] != "approved":
+        return {"approval": approval}  # the gate stays shut: no write
+
+    # No duplicates: a request for this system filed since the lookup wins.
+    requests = await toolbox.call("list_access_requests", employee_id=request.employee_id)
+    for existing in requests:
+        same_system = existing["system_id"] == diagnosis.system_id
+        if same_system and existing["status"] not in CLOSED_REQUEST_STATUSES:
+            return {"problem": f"{existing['request_id']} is already filed; nothing new was filed."}
+
+    # Over the seat limit, the request is filed but blocked (decision D-a).
+    blocked = diagnosis.over_seat_limit
+    [filed] = await toolbox.call(
+        "create_access_request",
+        employee_id=request.employee_id, software=diagnosis.system_name,
+        business_justification=f"Approved by {approval['approver_id']} in {approval_id}.",
+        status="blocked" if blocked else "approved",
+        approver_id=approval["approver_id"],
+        decision_reason=diagnosis.seat_reason if blocked else f"Approved in {approval_id}.",
+    )
+    return {"approval": approval, "filed": filed}
+
+
 # 5. RESPOND -----------------------------------------------------------------------
 
 async def respond(state: WebexState, answer_model) -> dict:
@@ -219,7 +256,7 @@ async def respond(state: WebexState, answer_model) -> dict:
     decision = build_decision(
         request, state["path"], diagnosis, state["records"], state["evidence"],
         make_request_key(diagnosis.employee_id, diagnosis.system_id),
-        state.get("approval"),
+        state.get("approval"), state.get("filed"),
     )
     decision.answer = await write_answer(answer_model, request, decision)
     return {"decision": decision}
@@ -235,6 +272,16 @@ def after_decide(state: WebexState) -> str:
     return "request_approval" if state["path"] == "approve_then_file" else "respond"
 
 
+def by_approval(state: WebexState) -> str:
+    """approved -> file_request; still open or rejected -> respond (which then
+    pauses or ends). Used after request_approval too, so a run stopped after the
+    approval but before filing files when asked again."""
+    approval = state.get("approval")
+    if not state.get("problem") and approval and approval["status"] == "approved":
+        return "file_request"
+    return "respond"
+
+
 def after_respond(state: WebexState) -> str:
     approval = state.get("approval")
     waiting = (state.get("path") == "approve_then_file" and not state.get("problem")
@@ -244,8 +291,9 @@ def after_respond(state: WebexState) -> str:
 
 def build_graph(toolbox: Toolbox, retriever: EvidenceRetriever, answer_model=None,
                 checkpointer=None):
-    """lookup -> search -> diagnose -> decide -> (request_approval) -> respond,
-    then respond -> wait -> respond while an approval is open.
+    """lookup -> search -> diagnose -> decide -> respond, except on approve_then_file:
+    request_approval, then by the approval's status: open -> respond -> wait (pause),
+    approved -> file_request -> respond, rejected -> respond.
     A lookup that finds nothing goes straight to respond.
 
     `answer_model` words the answer (a fake in tests). Not called `writer`: LangGraph
@@ -260,6 +308,7 @@ def build_graph(toolbox: Toolbox, retriever: EvidenceRetriever, answer_model=Non
     graph.add_node("request_approval", partial(request_approval, toolbox=toolbox))
     graph.add_node("respond", partial(respond, answer_model=answer_model or get_model()))
     graph.add_node("wait", partial(wait_for_approval, toolbox=toolbox))
+    graph.add_node("file_request", partial(file_request, toolbox=toolbox))
 
     graph.add_edge(START, "lookup")
     graph.add_conditional_edges("lookup", after_lookup, {"search": "search", "respond": "respond"})
@@ -268,9 +317,11 @@ def build_graph(toolbox: Toolbox, retriever: EvidenceRetriever, answer_model=Non
     graph.add_conditional_edges(
         "decide", after_decide, {"request_approval": "request_approval", "respond": "respond"},
     )
-    graph.add_edge("request_approval", "respond")
+    approval_routes = {"file_request": "file_request", "respond": "respond"}
+    graph.add_conditional_edges("request_approval", by_approval, approval_routes)
     graph.add_conditional_edges("respond", after_respond, {"wait": "wait", END: END})
-    graph.add_edge("wait", "respond")
+    graph.add_conditional_edges("wait", by_approval, approval_routes)
+    graph.add_edge("file_request", "respond")
     return graph.compile(checkpointer=checkpointer)
 
 
@@ -300,5 +351,5 @@ async def run_webex(graph, toolbox: Toolbox, request: WebexRequest) -> AccessDec
     Asking again lands on the same saved run and starts it over from lookup, so it
     sees what's in the database now: the approval it already asked for is reused."""
     config = run_config(await request_key_for(toolbox, request))
-    final_state = await graph.ainvoke({"request": request, "approval": None}, config)
+    final_state = await graph.ainvoke({"request": request, "approval": None, "filed": None}, config)
     return final_state["decision"]
