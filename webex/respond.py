@@ -9,7 +9,9 @@ import json
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from maya.schemas import Evidence, EvidenceCitation
-from webex.schemas import AccessDecision, Diagnosis, ObservedFact, WebexRequest
+from webex.schemas import (
+    AccessDecision, ActionTaken, Diagnosis, ObservedFact, WebexRequest,
+)
 
 # How many retrieved chunks to list as observed facts.
 EVIDENCE_FACTS = 3
@@ -18,7 +20,9 @@ EVIDENCE_FACTS = 3
 # subscription (docs/webex-design.md, section 6).
 SEAT_NEXT_STEP = "IT Manager to reclaim unused seats, or get Finance to approve more"
 
-# Paths that end the run here without writing (the approval path is a later step).
+OPEN_APPROVAL_STATUSES = {"needed", "pending"}
+
+# Paths that end the run without writing anything.
 OUTCOMES = {"answer_only": "answered", "reuse": "existing_request_reused", "refuse": "refused"}
 
 
@@ -75,20 +79,44 @@ def next_steps(diagnosis: Diagnosis, records: dict) -> list[str]:
     return steps
 
 
+def approval_result(approval: dict, diagnosis: Diagnosis) -> tuple:
+    """(status, outcome, next_steps) for the approve-then-file path."""
+    approval_id, approver = approval["approval_id"], approval["approver_id"]
+    if approval["status"] in OPEN_APPROVAL_STATUSES:
+        steps = [f"{approver} to decide approval {approval_id}: python -m webex.approve "
+                 f"{approval_id} --as {approver} --decision approved (or rejected)"]
+        return "pending", "approval_requested", steps
+    if approval["status"] == "rejected":
+        return "completed", "refused", []
+    # Approved. Filing the request is the next build step (the write gate).
+    return "pending", "approval_requested", ["File the access request (not built yet)"]
+
+
+def approval_action(approval: dict) -> ActionTaken:
+    return ActionTaken(
+        tool="request_approval", record_id=approval["approval_id"],
+        summary=f"Asked {approval['approver_id']} to approve {approval['request_id']}",
+    )
+
+
 def build_decision(request: WebexRequest, path: str, diagnosis: Diagnosis, records: dict,
-                   evidence: list[Evidence], request_key: str) -> AccessDecision:
+                   evidence: list[Evidence], request_key: str,
+                   approval: dict | None = None) -> AccessDecision:
     """The full AccessDecision, with a placeholder answer the model then replaces."""
-    steps = next_steps(diagnosis, records)
+    steps, actions = next_steps(diagnosis, records), []
+    reason = diagnosis.seat_reason if diagnosis.over_seat_limit else None
     if path == "approve_then_file":
-        # Not built yet (design build step 4): say so, and write nothing.
-        status, outcome, reason = "needs_human", "answered", None
-        steps = ["File the request by hand: the approval step isn't built yet"]
+        status, outcome, steps = approval_result(approval, diagnosis)
+        actions = [approval_action(approval)]
+        if reason:
+            steps.append(SEAT_NEXT_STEP)  # filing won't free a seat
     elif path == "refuse":
         status, outcome, reason = "completed", "refused", None
     else:
         # Something outside the person's control stands in the way, or nothing does.
-        reason = diagnosis.seat_reason if diagnosis.over_seat_limit else None
         status, outcome = ("blocked" if reason else "completed"), OUTCOMES[path]
+    if status != "blocked":
+        reason = None  # only a blocked decision names a blocker
 
     existing = [t["ticket_id"] for t in system_tickets(diagnosis, records)]
     existing += [diagnosis.existing_request_id] if diagnosis.existing_request_id else []
@@ -97,7 +125,7 @@ def build_decision(request: WebexRequest, path: str, diagnosis: Diagnosis, recor
         request_key=request_key, employee_id=request.employee_id,
         system=diagnosis.system_name, status=status, outcome=outcome,
         blocking_reason=reason, observed_facts=observed_facts(diagnosis, records, evidence),
-        existing_records=existing, next_steps=steps, answer="",
+        actions_taken=actions, existing_records=existing, next_steps=steps, answer="",
     )
 
 

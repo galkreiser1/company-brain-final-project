@@ -5,8 +5,12 @@ The steps (docs/webex-design.md, section 3), each its own graph node:
   search   -> searches the help articles, policies, contracts and memos
   diagnose -> turns the records into a Diagnosis
   decide   -> picks one path: answer_only, reuse, approve_then_file or refuse
+  request_approval -> (approve_then_file only) saves an approval for the manager
   respond  -> code builds the AccessDecision; a model writes only its `answer`
-Read-only so far: no step writes anything.
+  wait     -> pauses until resumed, then re-reads the approval from the database
+
+Each run is saved under its request key (webex-E001-S001) in
+runs/webex_checkpoints.sqlite, so a paused run survives the program stopping.
 
 Each step gets the state and returns only the keys it changes, as in maya/graph.py.
 """
@@ -15,8 +19,14 @@ import json
 from functools import partial
 from typing import TypedDict
 
+import aiosqlite
+from contextlib import asynccontextmanager
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
+from maya.config import REPO_ROOT
 from maya.model import get_model
 from maya.retrieval import EvidenceRetriever
 from maya.schemas import CallerContext, Evidence
@@ -31,6 +41,14 @@ IT_GROUP = "UG_IT"
 # A request in one of these states is over, so it can't be reused.
 CLOSED_REQUEST_STATUSES = {"rejected", "denied", "cancelled", "revoked"}
 OPEN_APPROVAL_STATUSES = {"needed", "pending"}
+# Where paused runs are saved. runs/ is git-ignored.
+CHECKPOINT_PATH = REPO_ROOT / "runs" / "webex_checkpoints.sqlite"
+# Our own types that a saved run holds. LangGraph will only load listed types back
+# from the file, so a tampered checkpoint can't make it build anything else.
+CHECKPOINT_SERDE = JsonPlusSerializer(allowed_msgpack_modules=[
+    ("webex.schemas", "WebexRequest"), ("webex.schemas", "Diagnosis"),
+    ("webex.schemas", "AccessDecision"), ("maya.schemas", "Evidence"),
+])
 # The document collections search looks in (Maya also searches employment files).
 SEARCH_COLLECTIONS = ["it_kb", "policies", "contracts", "internal_memos"]
 
@@ -42,6 +60,7 @@ class WebexState(TypedDict, total=False):
     evidence: list[Evidence]
     diagnosis: Diagnosis
     path: DecisionPath
+    approval: dict | None   # the approvals row this run asked for
     decision: AccessDecision
 
 
@@ -98,12 +117,13 @@ def diagnose(state: WebexState) -> dict:
     ]
     existing_request_id = existing[0]["request_id"] if existing else None
 
-    # Approvals still waiting, for that request or for this run's own key.
-    request_key = make_request_key(employee["employee_id"], system_id)
-    related_ids = {existing_request_id, request_key}
+    # Approvals still waiting on that request. (The approval this run asks for
+    # itself is kept in state["approval"] and reported as an action, not here,
+    # so a replay reports the same thing as the first run.)
     open_approval_ids = [
         a["approval_id"] for a in records["approvals"]
-        if a["request_id"] in related_ids and a["status"] in OPEN_APPROVAL_STATUSES
+        if existing_request_id and a["request_id"] == existing_request_id
+        and a["status"] in OPEN_APPROVAL_STATUSES
     ]
 
     diagnosis = Diagnosis(
@@ -150,6 +170,37 @@ def search(state: WebexState, retriever: EvidenceRetriever) -> dict:
     return {"evidence": evidence}
 
 
+# 4b. ASK FOR APPROVAL, AND WAIT -----------------------------------------------------
+
+async def request_approval(state: WebexState, toolbox: Toolbox) -> dict:
+    """Ask the employee's manager to approve. The tool returns the existing row
+    instead of adding one if this request key already has one, so a replay is safe."""
+    employee, diagnosis = state["records"]["employee"], state["diagnosis"]
+    if not employee["manager_id"]:
+        return {"problem": f"{employee['employee_id']} has no manager to approve."}
+    [approval] = await toolbox.call(
+        "request_approval",
+        request_key=make_request_key(diagnosis.employee_id, diagnosis.system_id),
+        approver_id=employee["manager_id"],
+        reason=f"Manager approval for {diagnosis.system_name} access for {diagnosis.employee_id}.",
+    )
+    return {"approval": approval}
+
+
+async def wait_for_approval(state: WebexState, toolbox: Toolbox) -> dict:
+    """Pause the run here. When resumed, read the approval row again.
+
+    interrupt() saves the run and stops. On resume, LangGraph runs this node again
+    from the top, and interrupt() then returns the resume value instead of stopping.
+    We don't use that value: a message saying "approved" can't approve anything.
+    """
+    approval = state["approval"]
+    interrupt({"approval_id": approval["approval_id"], "approver_id": approval["approver_id"]})
+    rows = await toolbox.call("list_approvals", employee_id=state["request"].employee_id)
+    [fresh] = [row for row in rows if row["approval_id"] == approval["approval_id"]]
+    return {"approval": fresh}
+
+
 # 5. RESPOND -----------------------------------------------------------------------
 
 async def respond(state: WebexState, answer_model) -> dict:
@@ -168,6 +219,7 @@ async def respond(state: WebexState, answer_model) -> dict:
     decision = build_decision(
         request, state["path"], diagnosis, state["records"], state["evidence"],
         make_request_key(diagnosis.employee_id, diagnosis.system_id),
+        state.get("approval"),
     )
     decision.answer = await write_answer(answer_model, request, decision)
     return {"decision": decision}
@@ -179,29 +231,74 @@ def after_lookup(state: WebexState) -> str:
     return "respond" if state.get("problem") else "search"
 
 
-def build_graph(toolbox: Toolbox, retriever: EvidenceRetriever, answer_model=None):
-    """lookup -> search -> diagnose -> decide -> respond, or lookup -> respond
-    when the person or subscription wasn't found.
+def after_decide(state: WebexState) -> str:
+    return "request_approval" if state["path"] == "approve_then_file" else "respond"
+
+
+def after_respond(state: WebexState) -> str:
+    approval = state.get("approval")
+    waiting = (state.get("path") == "approve_then_file" and not state.get("problem")
+               and approval and approval["status"] in OPEN_APPROVAL_STATUSES)
+    return "wait" if waiting else END
+
+
+def build_graph(toolbox: Toolbox, retriever: EvidenceRetriever, answer_model=None,
+                checkpointer=None):
+    """lookup -> search -> diagnose -> decide -> (request_approval) -> respond,
+    then respond -> wait -> respond while an approval is open.
+    A lookup that finds nothing goes straight to respond.
 
     `answer_model` words the answer (a fake in tests). Not called `writer`: LangGraph
-    fills a node argument with that name itself."""
+    fills a node argument with that name itself.
+    `checkpointer` saves each run (an open_checkpointer(), or InMemorySaver in tests);
+    the pause needs one."""
     graph = StateGraph(WebexState)
     graph.add_node("lookup", partial(lookup, toolbox=toolbox))
     graph.add_node("search", partial(search, retriever=retriever))
     graph.add_node("diagnose", diagnose)
     graph.add_node("decide", decide)
+    graph.add_node("request_approval", partial(request_approval, toolbox=toolbox))
     graph.add_node("respond", partial(respond, answer_model=answer_model or get_model()))
+    graph.add_node("wait", partial(wait_for_approval, toolbox=toolbox))
 
     graph.add_edge(START, "lookup")
     graph.add_conditional_edges("lookup", after_lookup, {"search": "search", "respond": "respond"})
     graph.add_edge("search", "diagnose")
     graph.add_edge("diagnose", "decide")
-    graph.add_edge("decide", "respond")
-    graph.add_edge("respond", END)
-    return graph.compile()
+    graph.add_conditional_edges(
+        "decide", after_decide, {"request_approval": "request_approval", "respond": "respond"},
+    )
+    graph.add_edge("request_approval", "respond")
+    graph.add_conditional_edges("respond", after_respond, {"wait": "wait", END: END})
+    graph.add_edge("wait", "respond")
+    return graph.compile(checkpointer=checkpointer)
 
 
-async def run_webex(graph, request: WebexRequest) -> AccessDecision:
-    """Run one request through the graph and return its AccessDecision."""
-    final_state = await graph.ainvoke({"request": request})
+@asynccontextmanager
+async def open_checkpointer():
+    CHECKPOINT_PATH.parent.mkdir(exist_ok=True)
+    async with aiosqlite.connect(CHECKPOINT_PATH) as conn:
+        yield AsyncSqliteSaver(conn, serde=CHECKPOINT_SERDE)
+
+
+async def request_key_for(toolbox: Toolbox, request: WebexRequest) -> str:
+    """e.g. "webex-E001-S001". Falls back to the software name if it matches no
+    single subscription (the run then stops at lookup anyway)."""
+    subscriptions = await toolbox.call("check_software_subscription", software=request.software)
+    system_id = subscriptions[0]["system_id"] if len(subscriptions) == 1 else request.software
+    return make_request_key(request.employee_id, system_id)
+
+
+def run_config(request_key: str) -> dict:
+    """LangGraph saves and finds a run by its thread_id: here, the request key."""
+    return {"configurable": {"thread_id": request_key}}
+
+
+async def run_webex(graph, toolbox: Toolbox, request: WebexRequest) -> AccessDecision:
+    """Run one request and return its AccessDecision (status "pending" if it paused).
+
+    Asking again lands on the same saved run and starts it over from lookup, so it
+    sees what's in the database now: the approval it already asked for is reused."""
+    config = run_config(await request_key_for(toolbox, request))
+    final_state = await graph.ainvoke({"request": request, "approval": None}, config)
     return final_state["decision"]

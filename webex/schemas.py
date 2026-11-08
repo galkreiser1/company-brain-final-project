@@ -92,7 +92,10 @@ Outcome = Literal[
 ]
 
 # These outcomes write nothing, so they must have no actions.
-NO_WRITE_OUTCOMES = ("answered", "existing_request_reused", "refused")
+NO_WRITE_OUTCOMES = ("answered", "existing_request_reused")
+# These outcomes are a write, so they must list it. "refused" is in neither list:
+# a refusal writes nothing, unless the approval it asked for was rejected.
+WRITE_OUTCOMES = ("approval_requested", "request_filed")
 
 
 class AccessDecision(BaseModel):
@@ -122,6 +125,6 @@ class AccessDecision(BaseModel):
         # write outcome must list the write it made.
         if self.outcome in NO_WRITE_OUTCOMES and self.actions_taken:
             raise ValueError(f"outcome {self.outcome} writes nothing, so it can't list actions")
-        if self.outcome not in NO_WRITE_OUTCOMES and not self.actions_taken:
+        if self.outcome in WRITE_OUTCOMES and not self.actions_taken:
             raise ValueError(f"outcome {self.outcome} must list the write it made")
         return self
