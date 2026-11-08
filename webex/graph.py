@@ -1,19 +1,29 @@
 """The Webex agent: works out why someone can't use a system, and what to do.
 
-Steps so far (docs/webex-design.md, section 3), each a graph node later:
+The steps (docs/webex-design.md, section 3), each its own graph node:
   lookup   -> calls the read tools, in a fixed order
-  diagnose -> turns their results into a Diagnosis
+  search   -> searches the help articles, policies, contracts and memos
+  diagnose -> turns the records into a Diagnosis
   decide   -> picks one path: answer_only, reuse, approve_then_file or refuse
-All three are plain code: no model decides anything here.
+  respond  -> code builds the AccessDecision; a model writes only its `answer`
+Read-only so far: no step writes anything.
 
 Each step gets the state and returns only the keys it changes, as in maya/graph.py.
 """
 
 import json
+from functools import partial
 from typing import TypedDict
 
-from maya.schemas import CallerContext
-from webex.schemas import DecisionPath, Diagnosis, WebexRequest, make_request_key
+from langgraph.graph import END, START, StateGraph
+
+from maya.model import get_model
+from maya.retrieval import EvidenceRetriever
+from maya.schemas import CallerContext, Evidence
+from webex.respond import build_decision, write_answer
+from webex.schemas import (
+    AccessDecision, DecisionPath, Diagnosis, WebexRequest, make_request_key,
+)
 from webex.tools import Toolbox
 
 HR_GROUP = "UG_HR"
@@ -21,14 +31,18 @@ IT_GROUP = "UG_IT"
 # A request in one of these states is over, so it can't be reused.
 CLOSED_REQUEST_STATUSES = {"rejected", "denied", "cancelled", "revoked"}
 OPEN_APPROVAL_STATUSES = {"needed", "pending"}
+# The document collections search looks in (Maya also searches employment files).
+SEARCH_COLLECTIONS = ["it_kb", "policies", "contracts", "internal_memos"]
 
 
 class WebexState(TypedDict, total=False):
     request: WebexRequest
     records: dict           # the read tools' results, by name
     problem: str | None     # why the run can't go on, e.g. "No employee E999."
+    evidence: list[Evidence]
     diagnosis: Diagnosis
     path: DecisionPath
+    decision: AccessDecision
 
 
 # 1. LOOKUP ------------------------------------------------------------------------
@@ -123,3 +137,71 @@ def decide(state: WebexState) -> dict:
     else:
         path = "answer_only"
     return {"path": path}
+
+
+# 2. SEARCH ------------------------------------------------------------------------
+
+def search(state: WebexState, retriever: EvidenceRetriever) -> dict:
+    """Find the help articles, policies, contract and memos about this system."""
+    request = state["request"]
+    system_name = state["records"]["subscription"]["system_name"]
+    query = f"{system_name} not licensed, seat limit, access request and approval"
+    evidence = retriever.search(query, request.caller, collections=SEARCH_COLLECTIONS)
+    return {"evidence": evidence}
+
+
+# 5. RESPOND -----------------------------------------------------------------------
+
+async def respond(state: WebexState, answer_model) -> dict:
+    """Build the AccessDecision. A failed lookup ends here as needs_human."""
+    request = state["request"]
+    if state.get("problem"):
+        decision = AccessDecision(
+            request_key=make_request_key(request.employee_id, request.software),
+            employee_id=request.employee_id, system=request.software,
+            status="needs_human", outcome="answered",
+            answer=f"I couldn't check this request: {state['problem']}",
+        )
+        return {"decision": decision}
+
+    diagnosis = state["diagnosis"]
+    decision = build_decision(
+        request, state["path"], diagnosis, state["records"], state["evidence"],
+        make_request_key(diagnosis.employee_id, diagnosis.system_id),
+    )
+    decision.answer = await write_answer(answer_model, request, decision)
+    return {"decision": decision}
+
+
+# THE GRAPH ------------------------------------------------------------------------
+
+def after_lookup(state: WebexState) -> str:
+    return "respond" if state.get("problem") else "search"
+
+
+def build_graph(toolbox: Toolbox, retriever: EvidenceRetriever, answer_model=None):
+    """lookup -> search -> diagnose -> decide -> respond, or lookup -> respond
+    when the person or subscription wasn't found.
+
+    `answer_model` words the answer (a fake in tests). Not called `writer`: LangGraph
+    fills a node argument with that name itself."""
+    graph = StateGraph(WebexState)
+    graph.add_node("lookup", partial(lookup, toolbox=toolbox))
+    graph.add_node("search", partial(search, retriever=retriever))
+    graph.add_node("diagnose", diagnose)
+    graph.add_node("decide", decide)
+    graph.add_node("respond", partial(respond, answer_model=answer_model or get_model()))
+
+    graph.add_edge(START, "lookup")
+    graph.add_conditional_edges("lookup", after_lookup, {"search": "search", "respond": "respond"})
+    graph.add_edge("search", "diagnose")
+    graph.add_edge("diagnose", "decide")
+    graph.add_edge("decide", "respond")
+    graph.add_edge("respond", END)
+    return graph.compile()
+
+
+async def run_webex(graph, request: WebexRequest) -> AccessDecision:
+    """Run one request through the graph and return its AccessDecision."""
+    final_state = await graph.ainvoke({"request": request})
+    return final_state["decision"]
