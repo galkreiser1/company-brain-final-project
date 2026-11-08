@@ -8,7 +8,22 @@ from typing import Literal
 
 from pydantic import BaseModel, computed_field, model_validator
 
-from maya.schemas import EvidenceCitation
+from maya.schemas import CallerContext, EvidenceCitation
+
+
+class WebexRequest(BaseModel):
+    """What run_webex() is asked, e.g. Rachel (E010) asking for her own Webex seat.
+
+    Code fills every field. The caller comes from the logged-in user, and
+    wants_filing from the caller's own words (e.g. "go ahead and file it"), so the
+    model can never decide to file on its own."""
+
+    caller: CallerContext   # who is asking, e.g. E010 (Rachel) or E004 (Sara, HR)
+    employee_id: str        # who needs access, e.g. "E010"
+    software: str = "Webex"
+    message: str            # the caller's words, for the reply
+    wants_filing: bool      # the caller asked for a request to be filed
+
 
 # The path the decide step picks (docs/webex-design.md, section 3).
 DecisionPath = Literal["answer_only", "reuse", "approve_then_file", "refuse"]

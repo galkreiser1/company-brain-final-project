@@ -39,7 +39,7 @@ DB_PATH = PROJECT_ROOT / "runs" / "novaops.db"
 # subject of the homework, not this lab.
 EMPLOYEE_FIELDS = (
     "employee_id, full_name, email, role, department_id, "
-    "manager_id, location, employment_type, status"
+    "manager_id, location, employment_type, status, systems_allowed_by_role"
 )
 
 
@@ -103,7 +103,8 @@ def check_software_subscription(software: str) -> list[dict]:
     """
     like = f"%{software}%"
     rows = _conn().execute(
-        "SELECT sys.system_name, v.vendor_name, sub.seat_limit, sub.active_seats, "
+        "SELECT sub.subscription_id, sub.system_id, sys.system_name, v.vendor_name, "
+        "       sub.seat_limit, sub.active_seats, "
         "       sub.status, sub.renewal_date, sub.annual_cost "
         "FROM software_subscriptions sub "
         "JOIN systems sys ON sub.system_id = sys.system_id "
@@ -161,7 +162,7 @@ def list_employee_tickets(employee_id: str, status: str = "") -> list[dict]:
     """
     rows = _conn().execute(
         "SELECT ticket_id, category, subcategory, priority, status, subject, "
-        "       created_at, assigned_team "
+        "       created_at, assigned_team, related_system_id "
         "FROM tickets WHERE employee_id = ? AND lower(status) LIKE lower(?) "
         "ORDER BY created_at DESC",
         (employee_id, f"%{status}%"),
