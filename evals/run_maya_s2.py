@@ -34,7 +34,7 @@ from maya.memory import DISTIL_PROMPT, PLANNER_PROMPT, estimate_tokens, render_m
 from maya.planning import ASSISTANT_PROMPT, IMPORTANT_POINTERS, message_text, render_transcript
 from maya.respond import tool_result_ids
 from maya.retrieval import OpenSearchRetriever
-from evals.s2_checks import check_handoff, check_turn, turn_handoffs
+from evals.s2_checks import check_handoff, check_homework_rules, check_turn, turn_handoffs
 
 
 GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"
@@ -202,6 +202,7 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
         "tool_calls": tool_calls,
         "handoffs": handoffs,
         "checks": (check_turn(turn, result, tool_calls, answer) + check_handoff(turn, handoffs)
+                   + check_homework_rules(turn, result, tool_calls, answer)
                    + [("finished without error", True)]),
         "error": None,
         "model_calls": recorder.calls[first_call:],

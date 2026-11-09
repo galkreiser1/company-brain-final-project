@@ -128,3 +128,92 @@ def check_handoff(turn: dict, handoffs: list[dict]) -> list[tuple[str, bool]]:
     passed = len(handoffs) == expected["count"] and len(matching) == len(handoffs)
     label = f"handoff {len(matching)}/{expected['count']} {expected['software']} {expected['status']}"
     return [(label + ("" if passed else f" (sent {len(handoffs)})"), passed)]
+
+
+# THE HOMEWORK'S RULES, ON EVERY TURN -----------------------------------------
+# Code only, no model judges: each rule is a string or field test anyone can rerun.
+
+TANGENT_CLOSED_FROM = 6  # turn 4 asks about Rachel Stein's ticket; turn 5 moves on
+TICKETS_CLOSED_FROM = 5  # from turn 5, nothing should look up tickets again
+TANGENT_WORDS = ["rachel", "t001"]  # her name, and her Webex ticket's ID
+# Words that make "granted" honest: "not granted", "isn't granted", "until granted"...
+NEGATIONS = ["not", "n't", "never", "until", "before"]
+
+
+def checklist_text(checklist: dict | None) -> str:
+    """Every item's name and reason, as one lowercase text to search."""
+
+    items = (checklist or {}).get("items") or []
+    return " ".join(f"{item['name']} {item.get('reason') or ''}" for item in items).lower()
+
+
+def check_tangent(number: int, answer: str, checklist: dict | None,
+                  tool_calls: list) -> list[tuple[str, bool]]:
+    """Once the Rachel tangent is over, it must stay out of answers and lookups."""
+
+    checks = []
+    if number >= TANGENT_CLOSED_FROM:
+        text = answer.lower() + " " + checklist_text(checklist)
+        found = [word for word in TANGENT_WORDS if word in text]
+        checks.append(("tangent closed" + (f" (found {', '.join(found)})" if found else ""),
+                       not found))
+    if number >= TICKETS_CLOSED_FROM:
+        called = any(call["name"] == "list_employee_tickets" for call in tool_calls)
+        checks.append(("no ticket lookup", not called))
+    return checks
+
+
+def citation_ids(citations: list[dict]) -> list[str]:
+    return [citation.get("chunk_id") or citation.get("record_id") for citation in citations]
+
+
+def check_citations(checklist: dict | None, sources_seen: list[str]) -> list[tuple[str, bool]]:
+    """On a checklist turn: every item is cited, and only with IDs Maya really saw.
+
+    A blocked item must also cite a database record (e.g. OT005, SUB001): a document
+    can say what someone needs, but only the live data shows it's blocked right now.
+    """
+
+    if not checklist:
+        return []
+    items = checklist.get("items") or []
+    seen = set(sources_seen)
+
+    uncited = [item["name"] for item in items if not item.get("citations")]
+    unseen = [cid for item in items for cid in citation_ids(item.get("citations") or [])
+              if cid not in seen]
+    weak_blockers = [
+        item["name"] for item in items
+        if item["status"] == "blocked"
+        and not (item.get("reason")
+                 and any(c.get("record_id") for c in item.get("citations") or []))
+    ]
+    return [
+        ("items cited" + (f" (none for {', '.join(uncited)})" if uncited else ""), not uncited),
+        ("citations seen" + (f" (unseen {', '.join(unseen)})" if unseen else ""), not unseen),
+        ("blockers cite a record" + (f" (not {', '.join(weak_blockers)})" if weak_blockers else ""),
+         not weak_blockers),
+    ]
+
+
+def says_granted(answer: str) -> bool:
+    """True if the answer says "granted" without a negation just before it."""
+
+    text = answer.lower()
+    start = text.find("granted")
+    while start != -1:
+        before = text[max(0, start - 15):start]
+        if not any(word in before for word in NEGATIONS):
+            return True
+        start = text.find("granted", start + 1)
+    return False
+
+
+def check_homework_rules(turn: dict, result: dict, tool_calls: list,
+                         answer: str) -> list[tuple[str, bool]]:
+    """The homework's per-turn rules: tangent closed, citations real, never "granted"."""
+
+    checklist = (result.get("reply") or {}).get("checklist")
+    return (check_tangent(turn["n"], answer, checklist, tool_calls)
+            + check_citations(checklist, result.get("sources_seen") or [])
+            + [("never granted", not says_granted(answer))])
