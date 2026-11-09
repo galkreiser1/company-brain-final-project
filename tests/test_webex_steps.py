@@ -346,3 +346,32 @@ def test_after_a_rejection_asking_again_asks_again():
     assert [a.record_id for a in decision.actions_taken] == ["AP006"]
     assert [a["status"] for a in db.list_approvals("E001")] == ["rejected", "needed"]
     assert filed_rows() == []
+
+
+# THE REAL PORT (webex/port.py), AS MAYA USES IT -----------------------------------
+
+def real_port():
+    from webex.port import RealWebexPort
+    return RealWebexPort(new_graph(), DbToolbox())
+
+
+def test_the_real_port_files_maya_cohen_as_pending():
+    from maya.schemas import WebexHandoff
+
+    handoff = WebexHandoff(employee_id="E001", software="Webex", caller=SARA_HR,
+                           reason="42 seats in use, contract limit 40",
+                           thread_id="s2", idempotency_key="k1")
+    result = asyncio.run(real_port().request_access(handoff))
+    assert (result.status, result.request_id, result.idempotency_key) == ("pending", "AP005", "k1")
+    assert result.answer
+
+
+def test_the_real_port_answers_rachel_without_filing():
+    from maya.schemas import WebexQuestion
+
+    question = WebexQuestion(caller=RACHEL, employee_id="E010",
+                             message="What is the status of my Webex login ticket?")
+    result = asyncio.run(real_port().ask(question))
+    assert (result.status, result.request_id) == ("blocked", "T001")
+    assert {c.record_id for c in result.citations} >= {"T001", "AR001", "SUB001"}
+    assert len(db.list_approvals("E010")) == 2  # AP001, AP002: nothing new

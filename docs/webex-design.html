@@ -355,7 +355,8 @@ and has no tools for access requests or approvals. The plan:</p>
 <h2>8. Connecting to Maya</h2>
 <ul>
 <li><code>RealWebexPort</code> (in <code>webex/port.py</code>) replaces <code>FakeWebexPort</code> outside tests. Its
-  <code>request_access(handoff)</code> calls <code>run_webex</code>. Maya's reply stays "pending", as now.</li>
+  <code>request_access(handoff)</code> calls <code>run_webex</code>. Maya's reply is Webex's own answer, with
+  Webex's real status (e.g. <code>blocked</code> when it reuses <code>AR001</code>), not a fixed "pending".</li>
 <li>Maya's <code>plan</code> step sends Webex topics to a new <code>webex</code> node that calls <code>run_webex</code>
   (see decision D2 for which topics).</li>
 <li>Tests keep using <code>FakeWebexPort</code>, so Maya's tests don't need the server.</li>
@@ -423,8 +424,9 @@ server, marked <code>integration</code> like Maya's.</p>
   don't show who holds a seat, only who is allowed one.</p>
 </li>
 <li>
-<p><strong>D2:</strong> <code>access_request</code> and <code>ticket_status</code> go to Webex; <code>subscription_review</code> stays
-  with Maya.</p>
+<p><strong>D2:</strong> <code>access_request</code> and <code>ticket_status</code> go to Webex <strong>when the message mentions
+  Webex</strong>; <code>subscription_review</code> stays with Maya. (A Salesforce request or a laptop ticket
+  stays with Maya too.)</p>
 </li>
 <li><strong>D3:</strong> code runs the lookups in a fixed order.</li>
 <li><strong>D4:</strong> own tool server in this repo, with a file database (section 7).</li>

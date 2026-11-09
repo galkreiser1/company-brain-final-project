@@ -65,6 +65,7 @@ from maya.schemas import (
     Evidence,
     MayaReply,
     WebexHandoff,
+    WebexQuestion,
     make_idempotency_key,
 )
 
@@ -171,7 +172,8 @@ def authorize_or_deny(state: AgentState, config: RunnableConfig) -> str:
     """Step 4: may this caller ask about the employee the message is about?
 
     Returns "deny" (see authorize_turn in retrieval.py), "handoff" (an allowed,
-    confirmed Webex request), or "retrieve" (go on). It runs before any search, tool
+    confirmed Webex request), "webex" (another Webex question, for the Webex scope),
+    or "retrieve" (go on, Maya answers). It runs before any search, tool
     or answer call: the MCP tools don't check who is asking, so stopping the whole
     turn is the only way to leak nothing.
     """
@@ -179,8 +181,11 @@ def authorize_or_deny(state: AgentState, config: RunnableConfig) -> str:
     plan = ContextPlan(**state["plan"])
     if not authorize_turn(caller_from_config(config), plan):
         return "deny"
-    if is_webex_go_ahead(plan, message_text(state["messages"][-1])):
+    user_message = message_text(state["messages"][-1])
+    if is_webex_go_ahead(plan, user_message):
         return "handoff"
+    if is_webex_question(plan, user_message):
+        return "webex"
     return "retrieve"
 
 
@@ -197,6 +202,26 @@ def is_webex_go_ahead(plan: ContextPlan, user_message: str) -> bool:
         and plan.action_confirmed
         and "webex" in user_message.lower()
         and plan.subject_employee_id is not None
+    )
+
+
+# The topics the Webex scope answers (decision D2), when the message is about Webex.
+# A Salesforce request or a laptop ticket stays with Maya.
+WEBEX_INTENTS = {"access_request", "ticket_status"}
+
+
+def is_webex_question(plan: ContextPlan, user_message: str) -> bool:
+    """True if Maya should pass this message to the Webex scope (without filing).
+
+    A named person must match an employee: otherwise Webex would be asked about the
+    caller instead of the person meant.
+    """
+
+    names_unknown_person = bool(plan.subject_name) and plan.subject_employee_id is None
+    return (
+        plan.current_intent in WEBEX_INTENTS
+        and "webex" in user_message.lower()
+        and not names_unknown_person
     )
 
 
@@ -256,9 +281,11 @@ async def handoff(state: AgentState, config: RunnableConfig, webex: WebexPort) -
     key = make_idempotency_key(thread_id, employee_id, "Webex")
     handoffs = dict(state.get("handoffs") or {})
 
+    citations = []
     if key in handoffs:
         result = handoffs[key]  # sent on an earlier turn (or a replay): don't resend
-        answer = handoff_sent_text(employee_id, result["request_id"])
+        answer = result.get("answer") or handoff_sent_text(employee_id, result["request_id"])
+        citations = result.get("citations") or []
     else:
         request = WebexHandoff(
             employee_id=employee_id,
@@ -271,14 +298,50 @@ async def handoff(state: AgentState, config: RunnableConfig, webex: WebexPort) -
         try:
             result = await webex.request_access(request)
             handoffs[key] = result.model_dump()
-            answer = handoff_sent_text(employee_id, result.request_id)
+            # Webex's own words, e.g. "blocked, AR001 is already on file" (decision O2).
+            # The fixed text is only for a port that sends none (the fake).
+            answer = result.answer or handoff_sent_text(employee_id, result.request_id)
+            citations = [citation.model_dump() for citation in result.citations]
         except Exception:  # the workflow is down: nothing was sent, nothing saved
             answer = HANDOFF_FAILED
 
     return {
         "messages": [AIMessage(answer)],
-        "reply": MayaReply(answer=answer).model_dump(),
+        "reply": MayaReply(answer=answer, citations=citations).model_dump(),
         "handoffs": handoffs,
+        "evidence": [],
+        "loadout": [],
+        "rearmed": False,
+    }
+
+
+WEBEX_FAILED = "I couldn't reach the Webex workflow, so I can't answer that right now."
+
+
+async def ask_webex(state: AgentState, config: RunnableConfig, webex: WebexPort) -> dict:
+    """Step 4w (a Webex question): pass it to the Webex scope and show its answer.
+
+    Webex looks up the records, searches the documents and writes the reply itself,
+    with its sources. It files nothing here: only a confirmed go-ahead (handoff) can
+    lead to a filing. Caller comes from the run's config, never from the message.
+    """
+
+    plan = ContextPlan(**state["plan"])
+    caller = caller_from_config(config)
+    question = WebexQuestion(
+        caller=caller,
+        employee_id=plan.subject_employee_id or caller.caller_id,
+        message=message_text(state["messages"][-1]),
+    )
+    try:
+        result = await webex.ask(question)
+        reply = MayaReply(answer=result.answer, citations=result.citations)
+    except Exception:  # Webex is down: say so, and claim nothing
+        reply = MayaReply(answer=WEBEX_FAILED)
+
+    return {
+        "messages": [AIMessage(reply.answer)],
+        "reply": reply.model_dump(),
         "evidence": [],
         "loadout": [],
         "rearmed": False,
@@ -469,7 +532,7 @@ def build_graph(tools: list, retriever: EvidenceRetriever, webex: WebexPort):
     `tools` can be everything the MCP server offers: only Maya's five read tools are
     kept (maya_tools), so no step can ever see another one.
     `retriever` searches the documents (an OpenSearchRetriever, or a fake in tests).
-    `webex` takes confirmed Webex requests (the real workflow, or FakeWebexPort).
+    `webex` takes Webex questions and confirmed requests (RealWebexPort, or FakeWebexPort).
 
     `partial(f, x=...)` makes a copy of f with x already filled in, so LangGraph can
     call each step with just the state.
@@ -493,6 +556,7 @@ def build_graph(tools: list, retriever: EvidenceRetriever, webex: WebexPort):
     graph.add_node("plan", partial(plan_turn, planner=planner, employee_ids=employee_ids))
     graph.add_node("deny", deny)
     graph.add_node("handoff", partial(handoff, webex=webex))
+    graph.add_node("webex", partial(ask_webex, webex=webex))
     graph.add_node("retrieve", partial(retrieve, retriever=retriever))
     graph.add_node("select", select)
     graph.add_node("model", partial(
@@ -505,17 +569,19 @@ def build_graph(tools: list, retriever: EvidenceRetriever, webex: WebexPort):
 
     # START -> (distil) -> plan -> (authorize) -> retrieve -> select -> model, then
     # model -> tools / rearm / respond -> END, and tools and rearm go back to model.
-    # A denied turn goes plan -> deny -> END instead, a Webex go-ahead plan -> handoff -> END.
+    # A denied turn goes plan -> deny -> END instead, a Webex go-ahead plan -> handoff -> END,
+    # and another Webex question plan -> webex -> END.
     graph.add_conditional_edges(
         START, distil_or_plan, {"distil": "distil", "plan": "plan"},
     )
     graph.add_edge("distil", "plan")
     graph.add_conditional_edges(
         "plan", authorize_or_deny,
-        {"retrieve": "retrieve", "deny": "deny", "handoff": "handoff"},
+        {"retrieve": "retrieve", "deny": "deny", "handoff": "handoff", "webex": "webex"},
     )
     graph.add_edge("deny", END)
     graph.add_edge("handoff", END)
+    graph.add_edge("webex", END)
     graph.add_edge("retrieve", "select")
     graph.add_edge("select", "model")
     graph.add_conditional_edges(

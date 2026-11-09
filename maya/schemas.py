@@ -142,10 +142,27 @@ def make_idempotency_key(thread_id: str, employee_id: str, software: str) -> str
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
 
 
+class WebexQuestion(BaseModel):
+    """A Webex question Maya passes on without filing anything, e.g. Rachel's
+    "I need Webex access" or "what's the status of my Webex login ticket?"."""
+
+    caller: CallerContext   # who asked, set by code from the run's config
+    employee_id: str        # who it's about: the plan's subject, or the caller
+    software: str = "Webex"
+    message: str            # the caller's own words
+
+
 class PendingAccessResult(BaseModel):
-    """What the Webex workflow answers: the request is in, and waits for approval."""
+    """What the Webex workflow answers, to a handoff or a question.
+
+    The name is from Milestone 3, when every answer was "pending". Now Webex reports
+    where it really got to, e.g. "blocked" when it reused Rachel's AR001.
+    """
 
     workflow: Literal["webex_access"]
-    status: Literal["pending"]  # never "granted": approval happens outside Maya
-    request_id: str             # the workflow's reference, e.g. "WX-13acdeaf"
-    idempotency_key: str        # the handoff's key, so a repeat can be matched to it
+    # Webex's AccessDecision status. There is no "granted": Webex never grants access.
+    status: Literal["completed", "blocked", "pending", "needs_human", "failed"]
+    request_id: str             # the main record, e.g. "AP005" or "AR001"
+    idempotency_key: str = ""   # the handoff's key, so a repeat can be matched to it
+    answer: str = ""            # Webex's reply text; Maya shows it as is
+    citations: list[EvidenceCitation] = []  # where Webex's facts came from

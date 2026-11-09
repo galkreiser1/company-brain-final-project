@@ -95,7 +95,8 @@ def test_only_a_webex_go_ahead_routes_to_handoff():
     okta = turn_10_state(message="File Okta access for her")
     not_confirmed = turn_10_state(action_confirmed=False)
     assert authorize_or_deny(okta, make_config()) == "retrieve"
-    assert authorize_or_deny(not_confirmed, make_config()) == "retrieve"
+    # Not confirmed: a Webex question for the Webex scope, which files nothing.
+    assert authorize_or_deny(not_confirmed, make_config()) == "webex"
 
 
 def test_denied_caller_never_reaches_the_port():

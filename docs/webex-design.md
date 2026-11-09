@@ -187,7 +187,8 @@ Maya still loads only its five read tools, so none of these reach her.
 ## 8. Connecting to Maya
 
 - `RealWebexPort` (in `webex/port.py`) replaces `FakeWebexPort` outside tests. Its
-  `request_access(handoff)` calls `run_webex`. Maya's reply stays "pending", as now.
+  `request_access(handoff)` calls `run_webex`. Maya's reply is Webex's own answer, with
+  Webex's real status (e.g. `blocked` when it reuses `AR001`), not a fixed "pending".
 - Maya's `plan` step sends Webex topics to a new `webex` node that calls `run_webex`
   (see decision D2 for which topics).
 - Tests keep using `FakeWebexPort`, so Maya's tests don't need the server.
@@ -229,8 +230,9 @@ Each step is small, reviewed and committed before the next (`/gradual-implement`
 - **`W-I-02`** (Yael: which team members have a Webex seat?): answer that the records
   don't show who holds a seat, only who is allowed one.
 
-- **D2:** `access_request` and `ticket_status` go to Webex; `subscription_review` stays
-  with Maya.
+- **D2:** `access_request` and `ticket_status` go to Webex **when the message mentions
+  Webex**; `subscription_review` stays with Maya. (A Salesforce request or a laptop ticket
+  stays with Maya too.)
 - **D3:** code runs the lookups in a fixed order.
 - **D4:** own tool server in this repo, with a file database (section 7).
 - **`W-S-01` turn 4:** reuse `AR001` and file nothing, as the spec says. `GOLDEN-DATASETS.json`

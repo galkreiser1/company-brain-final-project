@@ -148,7 +148,9 @@ WRITER_PROMPT = (
     "record ids and next steps in the JSON. Never say access was granted or a seat was "
     "assigned. Don't promise anything that isn't in next_steps. Name records only by "
     "their ids (e.g. AR005, AP005, T001). Copy numbers and the blocking_reason exactly "
-    "as written; don't reword them."
+    "as written; don't reword them. Answer the caller's actual question first: a "
+    "ticket's or a request's status is the one in its own observed fact (e.g. "
+    "\"Ticket T001 is open\"), not the decision's status."
 )
 
 
