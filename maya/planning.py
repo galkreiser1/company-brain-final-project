@@ -163,7 +163,50 @@ class ContextPlan(TurnPlan):
     """The planner's TurnPlan, plus two fields that code fills in (never the model)."""
 
     subject_employee_id: str | None = None  # e.g. "E001" for subject_name "Maya Cohen"
+    subject_name_corrected: bool = False    # the message misspelled it, e.g. "rrachel stein"
     required_evidence: list[str] = []       # collections to search, e.g. ["employment", "policies"]
+
+
+def within_one_letter(a: str, b: str) -> bool:
+    """True if a and b differ by at most one letter: one extra, missing or changed.
+
+    "rrachel" and "rachel" do (one extra r); "stien" and "stein" don't (two letters
+    swapped is two changes).
+    """
+
+    if len(a) > len(b):
+        a, b = b, a  # a is now the shorter one, or the same length
+    if len(b) - len(a) > 1:
+        return False
+    same = 0  # how many letters match at the start
+    while same < len(a) and a[same] == b[same]:
+        same += 1
+    if len(a) == len(b):
+        return a[same + 1:] == b[same + 1:]  # skip one changed letter
+    return a[same:] == b[same + 1:]          # skip b's one extra letter
+
+
+def match_employee_name(name: str, employee_ids: dict[str, str]) -> str | None:
+    """The employee's full name that `name` means, or None.
+
+    An exact match (any case) wins. If there's none, a name whose every word is at
+    most one letter off (within_one_letter) counts, e.g. "rrachel stein" means
+    "Rachel Stein". Only if exactly one employee is that close: when two could be
+    meant, guessing would answer about the wrong person.
+    """
+
+    wanted = name.strip().lower().split()
+    if not wanted:
+        return None
+    for full_name in employee_ids:
+        if full_name.lower().split() == wanted:
+            return full_name
+    close = [
+        full_name for full_name in employee_ids
+        if len(full_name.split()) == len(wanted)
+        and all(within_one_letter(w, f) for w, f in zip(wanted, full_name.lower().split()))
+    ]
+    return close[0] if len(close) == 1 else None
 
 
 def build_context_plan(turn_plan: TurnPlan, employee_ids: dict[str, str]) -> ContextPlan:
@@ -171,19 +214,25 @@ def build_context_plan(turn_plan: TurnPlan, employee_ids: dict[str, str]) -> Con
 
     Gets: the planner's TurnPlan, and {full name: employee id} (load_employee_ids).
     Returns: the ContextPlan.
-      - subject_employee_id: the id whose full name matches subject_name exactly,
-        ignoring case. None if there's no name, or no employee has it.
+      - subject_employee_id: the id of the employee subject_name means
+        (match_employee_name: exact, or each word one letter off). None if there's no
+        name, or no single employee matches. A matched misspelling is replaced by the
+        real name, e.g. "rrachel stein" becomes "Rachel Stein".
       - required_evidence: the topic's collections if documents are needed, else [].
     """
 
-    ids_by_lower_name = {name.lower(): emp_id for name, emp_id in employee_ids.items()}
-    subject_id = ids_by_lower_name.get(turn_plan.subject_name.strip().lower())
+    matched_name = match_employee_name(turn_plan.subject_name, employee_ids)
+    subject_id = employee_ids[matched_name] if matched_name else None
 
     required = []
     if turn_plan.needs_documents:
         required = list(REQUIRED_COLLECTIONS.get(turn_plan.current_intent, []))
 
-    return ContextPlan(**turn_plan.model_dump(), subject_employee_id=subject_id,
+    fields = turn_plan.model_dump()
+    corrected = bool(matched_name) and matched_name.lower() != turn_plan.subject_name.strip().lower()
+    if matched_name:
+        fields["subject_name"] = matched_name
+    return ContextPlan(**fields, subject_employee_id=subject_id, subject_name_corrected=corrected,
                        required_evidence=required)
 
 
@@ -352,13 +401,21 @@ def _bullets(items: list[str]) -> str:
 def render_plan(plan: TurnPlan) -> str:
     """The plan as text, added to the end of the answer call's system prompt.
 
-    It includes the intent, facts, and constraints. The lookup flags, the subject and
-    `action_confirmed` aren't included: the answer model doesn't need them.
+    It includes the intent, facts, and constraints, plus the right name when the
+    message misspelled one. The lookup flags, the subject and `action_confirmed` aren't
+    included otherwise: the answer model doesn't need them.
     """
 
+    # Only after a corrected misspelling: otherwise the model would look up the name as
+    # typed ("rrachel stein") and find nobody. Only a ContextPlan has these fields.
+    subject = ""
+    if getattr(plan, "subject_name_corrected", False):
+        subject = (f"The name in the message is misspelled: it means {plan.subject_name} "
+                   f"({plan.subject_employee_id}). Look them up by this id.\n")
     return (
         "\n\n--- CONTEXT FOR THIS TURN ---\n"
         f"User's current intent: {plan.current_intent}\n"
+        f"{subject}"
         f"Established facts you must use:\n{_bullets(plan.relevant_facts)}\n"
         f"Constraints still in force:\n{_bullets(plan.relevant_constraints)}\n"
         "--- END CONTEXT ---"

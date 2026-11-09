@@ -14,3 +14,4 @@ langgraph-checkpoint-sqlite  # saves paused Webex runs to a file (AsyncSqliteSav
 langchain-mcp-adapters    # load the MCP server's tools as LangChain tools
 opensearch-py
 pytest
+pyyaml                    # reads data/EVALUATION-INPUTS.yaml (evals/run_webex.py)

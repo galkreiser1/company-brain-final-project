@@ -110,6 +110,7 @@ class AccessDecision(BaseModel):
     observed_facts: list[ObservedFact] = []
     actions_taken: list[ActionTaken] = []
     existing_records: list[str] = []   # e.g. ["T001", "AR001", "AP001", "AP002"]
+    request_id: str | None = None      # the access request it's about: reused or filed
     next_steps: list[str] = []         # e.g. ["IT Manager (E006) to approve AP001"]
     answer: str                        # the text the person reads; the model writes it
 

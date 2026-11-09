@@ -11,9 +11,12 @@ from webex.tools import Toolbox
 
 
 def to_result(decision: AccessDecision, idempotency_key: str = "") -> PendingAccessResult:
-    """Webex's decision in Maya's terms. The main record is the last thing this run
-    wrote (AP005, then AR005), else the first existing one (T001 or AR001)."""
-    if decision.actions_taken:
+    """Webex's decision in Maya's terms. The main record is the access request it's
+    about (AR001 reused, AR005 filed), else the approval it asked for (AP005), else
+    the first existing record."""
+    if decision.request_id:
+        main_record = decision.request_id
+    elif decision.actions_taken:
         main_record = decision.actions_taken[-1].record_id
     elif decision.existing_records:
         main_record = decision.existing_records[0]

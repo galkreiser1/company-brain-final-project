@@ -144,7 +144,7 @@ def test_rachel_ends_blocked_and_writes_nothing():
     assert decision.existing_records == ["T001", "AR001", "AP001", "AP002"]
     assert decision.actions_taken == []
     assert [s.split()[0] for s in decision.next_steps] == ["E006", "E011"]
-    assert decision.answer == "Your request AR001 is already on file."
+    assert decision.answer == "Your request AR001 is already on file.\n\nStatus: blocked (request AR001)."
     # The search ran as Rachel, so her own document filter applied.
     assert retriever.queries[0][1] == "E010"
 
@@ -372,6 +372,6 @@ def test_the_real_port_answers_rachel_without_filing():
     question = WebexQuestion(caller=RACHEL, employee_id="E010",
                              message="What is the status of my Webex login ticket?")
     result = asyncio.run(real_port().ask(question))
-    assert (result.status, result.request_id) == ("blocked", "T001")
+    assert (result.status, result.request_id) == ("blocked", "AR001")
     assert {c.record_id for c in result.citations} >= {"T001", "AR001", "SUB001"}
     assert len(db.list_approvals("E010")) == 2  # AP001, AP002: nothing new

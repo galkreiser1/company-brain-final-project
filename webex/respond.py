@@ -139,6 +139,7 @@ def build_decision(request: WebexRequest, path: str, diagnosis: Diagnosis, recor
         system=diagnosis.system_name, status=status, outcome=outcome,
         blocking_reason=reason, observed_facts=observed_facts(diagnosis, records, evidence),
         actions_taken=actions, existing_records=existing, next_steps=steps, answer="",
+        request_id=filed["request_id"] if filed else diagnosis.existing_request_id,
     )
 
 
@@ -150,16 +151,25 @@ WRITER_PROMPT = (
     "their ids (e.g. AR005, AP005, T001). Copy numbers and the blocking_reason exactly "
     "as written; don't reword them. Answer the caller's actual question first: a "
     "ticket's or a request's status is the one in its own observed fact (e.g. "
-    "\"Ticket T001 is open\"), not the decision's status."
+    "\"Ticket T001 is open\"), not the decision's status. Address the reader as "
+    "\"you\", without a greeting; name everyone else by their id (e.g. E006). Plain "
+    "text, no markdown."
 )
 
 
 async def write_answer(answer_model, request: WebexRequest, decision: AccessDecision) -> str:
-    """Ask the model for the reply text. The decision it reads is already final."""
+    """Ask the model for the reply text, then add the status line, e.g.
+    "Status: blocked (request AR001).".
+
+    The decision it reads is already final. The status line comes from code, so the
+    reply always states where the request really is (e.g. "Status: pending."), and
+    the model can't leave it out or word it differently."""
     # Without the run key: it's internal, and the model kept calling the request by it.
     facts = decision.model_dump(exclude={"answer", "request_key"})
     reply = await answer_model.ainvoke([
         SystemMessage(WRITER_PROMPT),
-        HumanMessage(f"Message: {request.message}\n\nDecision:\n{json.dumps(facts, indent=1)}"),
+        HumanMessage(f"Reader: {request.caller.caller_id}\nMessage: {request.message}\n\n"
+                     f"Decision:\n{json.dumps(facts, indent=1)}"),
     ])
-    return reply.text
+    about = f" (request {decision.request_id})" if decision.request_id else ""
+    return f"{reply.text.strip()}\n\nStatus: {decision.status}{about}."

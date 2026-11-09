@@ -1,6 +1,8 @@
 """The S2 runner: replay golden session S2 on the Maya agent and check each turn.
 
-Needs Lesson 10's MCP server running. Run from the repo root:
+Needs this repo's MCP server running (python -m server.server). Webex questions and
+the turn 10 handoff go through the real Webex workflow (webex/), which reads and writes
+runs/novaops.db. Run from the repo root:
     .venv/bin/python -m evals.run_maya_s2             # all 12 turns
     .venv/bin/python -m evals.run_maya_s2 --turns 3   # a quick run
 
@@ -29,12 +31,12 @@ from maya.config import MCP_SERVER_URL, REPO_ROOT
 import maya.memory
 from maya.graph import REFUSAL, build_graph
 from maya.loadout import MAYA_READ_TOOLS
-from maya.ports import FakeWebexPort
 from maya.memory import DISTIL_PROMPT, PLANNER_PROMPT, estimate_tokens, render_memory
 from maya.planning import ASSISTANT_PROMPT, IMPORTANT_POINTERS, message_text, render_transcript
 from maya.respond import tool_result_ids
 from maya.retrieval import OpenSearchRetriever
 from evals.s2_checks import check_handoff, check_homework_rules, check_turn, turn_handoffs
+from evals.webex_recording import RecordingWebexPort, real_webex_port
 
 
 GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"
@@ -158,6 +160,17 @@ def latest_turn_start(messages: list) -> int:
     )
 
 
+def turn_route(denied: bool, asked_webex: bool, handoffs: list) -> str:
+    """Who answered the turn: "deny", "webex" (a Webex question), "handoff" (a Webex
+    go-ahead that was sent), or "maya"."""
+
+    if denied:
+        return "deny"
+    if handoffs:
+        return "handoff"
+    return "webex" if asked_webex else "maya"
+
+
 def describe_handoffs(handoffs: list[dict]) -> str:
     """This turn's handoffs on one line, like "E001 Webex pending (WX-13acdeaf)"."""
 
@@ -169,12 +182,14 @@ def describe_handoffs(handoffs: list[dict]) -> str:
 
 
 async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
-                   retriever: RecordingRetriever, webex: FakeWebexPort) -> dict:
+                   retriever: RecordingRetriever, webex: RecordingWebexPort) -> dict:
     """Send one user message, then collect what happened in that turn."""
 
     first_call = len(recorder.calls)
     first_search = len(retriever.searches)
     first_handoff = len(webex.calls)
+    first_question = len(webex.questions)
+    first_webex_tool = len(webex.tool_calls)
     # Where the memory ended before this turn, to tell if a distil was kept or rejected.
     before = (await graph.aget_state(config)).values.get("distilled_upto", 0)
     # Only the new message is sent. The checkpointer adds the earlier ones.
@@ -189,6 +204,12 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
     ]
     answer = message_text(messages[-1])
     handoffs = turn_handoffs(webex, first_handoff, result)
+    asked_webex = len(webex.questions) > first_question
+    # Tools the Webex workflow called for this turn. On a Webex question they count as
+    # the turn's lookups (turn 4's list_employee_tickets: Webex answers it now). On a
+    # handoff they don't: Maya only passes the request on (turn 10 needs no lookup).
+    webex_tool_calls = webex.tool_calls[first_webex_tool:]
+    checked_calls = tool_calls + (webex_tool_calls if asked_webex else [])
     evidence = result.get("evidence") or []
     return {
         "turn": turn,
@@ -198,11 +219,13 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
                        + tool_result_ids(messages[turn_start:])),
         "plan": result["plan"],
         "denied": answer == REFUSAL,  # the authorize step sent the turn down the deny path
+        "route": turn_route(answer == REFUSAL, asked_webex, handoffs),
         "loadout": result["loadout"],
         "tool_calls": tool_calls,
+        "webex_tool_calls": webex_tool_calls,
         "handoffs": handoffs,
-        "checks": (check_turn(turn, result, tool_calls, answer) + check_handoff(turn, handoffs)
-                   + check_homework_rules(turn, result, tool_calls, answer)
+        "checks": (check_turn(turn, result, checked_calls, answer) + check_handoff(turn, handoffs)
+                   + check_homework_rules(turn, result, checked_calls, answer)
                    + [("finished without error", True)]),
         "error": None,
         "model_calls": recorder.calls[first_call:],
@@ -219,7 +242,7 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
 
 
 async def run_turn_safely(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
-                          retriever: RecordingRetriever, webex: FakeWebexPort) -> dict:
+                          retriever: RecordingRetriever, webex: RecordingWebexPort) -> dict:
     """run_turn, but a crash becomes a failed turn instead of ending the run.
 
     A crash on turn 6 (say, GraphRecursionError) must not hide turns 7-12. The next
@@ -235,6 +258,8 @@ async def run_turn_safely(graph, config: dict, recorder: ModelCallRecorder, turn
             "error": f"{type(error).__name__}: {error}",
             "answer": "",
             "tool_calls": [],
+            "webex_tool_calls": [],
+            "route": "?",
             "handoffs": [],
             "checks": [("finished without error", False)],
             "model_calls": recorder.calls[first_call:],  # the calls made before the crash
@@ -428,6 +453,12 @@ def indent(text: str, spaces: int) -> str:
 
 # THE TWO OUTPUTS -------------------------------------------------------------
 
+ROUTE_NOTES = {
+    "webex": " (Maya passed the question to the Webex workflow; its answer is shown)",
+    "handoff": " (a confirmed Webex request, sent to the Webex workflow)",
+}
+
+
 def print_turn(number: int, outcome: dict) -> None:
     """The short terminal summary of one turn."""
 
@@ -457,8 +488,12 @@ def print_turn(number: int, outcome: dict) -> None:
           f"({'DENIED' if outcome['denied'] else 'allowed'}) · "
           f"facts: {len(plan['relevant_facts'])} · constraints: {len(plan['relevant_constraints'])}")
     loadout = outcome["loadout"]
+    print(f"  route:   {outcome['route']}" + ROUTE_NOTES.get(outcome["route"], ""))
     print(f"  loadout: {', '.join(loadout) or '(no tools)'} ({len(loadout)} of {TOOL_COUNT})")
     print(f"  tools:   {tools or '(none)'}")
+    if outcome["webex_tool_calls"]:
+        webex_tools = ", ".join(describe_tool_call(call) for call in outcome["webex_tool_calls"])
+        print(f"  webex tools: {webex_tools}")
     print(f"  evidence: {describe_searches(outcome['searches'])} · "
           f"{describe_evidence(outcome['evidence'], reply)}")
     print(f"  cites:   {describe_citations(reply)}")
@@ -560,6 +595,9 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
 
     lines += [
         "",
+        f"ROUTE    {outcome['route']}",
+        "WEBEX TOOLS " + (", ".join(describe_tool_call(call) for call in outcome["webex_tool_calls"])
+                          or "(none)"),
         f"CHECKS   {describe_checks(outcome['checks'])}",
         f"EVIDENCE {describe_searches(outcome['searches'])} · "
         f"{describe_evidence(outcome['evidence'], outcome['reply'])}",
@@ -590,7 +628,9 @@ def turn_record(number: int, outcome: dict) -> dict:
         "reply": outcome.get("reply"),
         "checklist": (outcome.get("reply") or {}).get("checklist"),
         "source_ids": outcome.get("source_ids", []),
+        "route": outcome.get("route"),
         "tool_calls": [{"name": call["name"], "args": call["args"]} for call in outcome["tool_calls"]],
+        "webex_tool_calls": outcome.get("webex_tool_calls", []),
         "handoffs": [{"handoff": sent["handoff"].model_dump(), "result": sent["result"]}
                      for sent in outcome["handoffs"]],
         "error": outcome["error"],
@@ -645,11 +685,11 @@ def turns_to_run() -> int:
     return parser.parse_args().turns
 
 
-async def replay_handoff_turn(graph, config: dict, turn: dict, webex: FakeWebexPort) -> bool:
+async def replay_handoff_turn(graph, config: dict, turn: dict, webex: RecordingWebexPort) -> bool:
     """Send the handoff turn's message once more, on the same thread. Returns passed.
 
     The checkpointer already holds the first send's key, so nothing new may reach the
-    workflow: the fake must still hold exactly one call, and the reply says pending.
+    workflow: the port must still hold exactly one call, and the reply says pending.
     """
 
     try:
@@ -669,7 +709,16 @@ async def main(turn_count: int) -> int:
 
     tools = await load_tools()
     retriever = RecordingRetriever(OpenSearchRetriever())
-    webex = FakeWebexPort()  # records each handoff instead of reaching a real workflow
+    # The real Webex workflow, recorded. Its own searches use the plain retriever, so
+    # `retriever.searches` stays Maya's only.
+    async with real_webex_port(tools, OpenSearchRetriever()) as webex:
+        return await run_session(tools, retriever, webex, turn_count)
+
+
+async def run_session(tools: list, retriever: RecordingRetriever, webex: RecordingWebexPort,
+                      turn_count: int) -> int:
+    """main()'s body, run while the Webex workflow's saved runs are open."""
+
     graph = build_graph(tools, retriever, webex)
     recorder = ModelCallRecorder()
     session = load_session()

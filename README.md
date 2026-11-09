@@ -46,7 +46,7 @@ The last step, `respond`, turns the answer into a `MayaReply`: the answer, its c
 
 ## Tools: database reads only
 
-Maya loads 5 of the MCP server's 10 tools: `get_employee`, `list_onboarding_tasks`, `check_asset_inventory`, `check_software_subscription` and `list_employee_tickets` (an allowlist in `maya/loadout.py`).
+Maya loads 5 of the MCP server's 14 tools: `get_employee`, `list_onboarding_tasks`, `check_asset_inventory`, `check_software_subscription` and `list_employee_tickets` (an allowlist in `maya/loadout.py`).
 
 - **The write tool** (`create_access_request`) is never loaded, so no fallback can expose it.
 - **The 4 document tools** (`search_hr_documents`, `search_knowledge_base`, `list_policies`, `get_policy`) are never loaded either. They return any document to anyone. Documents come only from Maya's own OpenSearch search, which filters by who is asking.
@@ -54,23 +54,57 @@ Maya loads 5 of the MCP server's 10 tools: `get_employee`, `list_onboarding_task
 
 ## The Webex handoff (S2 turn 10)
 
-Maya never writes to a system. When the user confirms a Webex access request ("go ahead and file it"), code hands it off once to the separate Webex approval workflow and replies "pending".
+Maya never writes to a system. When the user confirms a Webex access request ("go ahead and file it"), code hands it off once to the Webex workflow (next section) and shows Webex's answer, e.g. "pending" with the approval it asked for.
 
 - The handoff goes through `WebexPort` (`maya/ports.py`), passed to `build_graph`. The turn makes no tool call, no search and no answer-model call.
 - Code decides, not the model: the planner must mark it a confirmed `access_request`, the user's message must say "Webex", and the subject must be a known employee.
 - The idempotency key (a hash of thread + employee + software) is saved with the result. Replaying the turn finds the key and sends nothing again; the smoke run replays turn 10 to prove it.
 - The reply never says "granted". If the workflow can't be reached, nothing is saved and the reply says nothing was sent.
-- Tests and the smoke run use `FakeWebexPort`, which records every call. The real Webex workflow comes later (Lesson 9).
+- Unit tests use `FakeWebexPort`, which records every call. The runners use the real one, `RealWebexPort` (`webex/port.py`).
+
+## Webex: IT access (Milestone 4)
+
+Webex is the IT scope of the same agent. Maya's plan step stays the only router: a Webex access or ticket question that mentions Webex goes to a `webex` node (`is_webex_question` in `maya/graph.py`), and a confirmed go-ahead goes through the handoff above. Both call `run_webex()`. The design and its decisions are in `docs/webex-design.md`.
+
+The Webex graph (`webex/graph.py`) is plain code except for the reply's wording:
+
+- **lookup → search → diagnose → decide.** Five read tools in a fixed order, a document search with the caller's own access filter, then one path: answer only, reuse an existing request, ask for approval then file, or refuse.
+- **No duplicates.** An open request for the same person and system is reused (Rachel's `AR001`). Each request has one saved run, named `webex-<employee>-<system>` (e.g. `webex-E001-S001`), so asking again lands on the same run.
+- **Approval pause.** `request_approval` saves an approval row for the employee's manager and the run pauses (`interrupt()`). Paused runs are saved in `runs/webex_checkpoints.sqlite` and survive a restart. A person decides with `python -m webex.approve AP005 --as E018 --decision approved` (`webex/approve.py`); the server checks they are the named approver, then the run resumes.
+- **Write gate.** `file_request` re-reads the approval row from the database and files only if it says `approved`. A message saying "approved" can't open it. Filed but still over the seat limit ends `blocked`.
+- **`AccessDecision`** (`webex/schemas.py`). Code fills every field: observed facts with their sources, actions taken (copied from real tool results), existing records, next steps. The model writes only `answer`; code adds a status line ("Status: blocked (request AR001).") and the type has no "granted" outcome.
+- **Tool server** (`server/`, from Lesson 10). The database is a file, `runs/novaops.db`, so writes survive restarts. It adds four tools: `list_access_requests`, `list_approvals`, `request_approval`, `record_approval_decision`. Webex's allowlist is in `webex/tools.py`.
+
+Proof of the durable behaviour (unit tests in `tests/test_webex_steps.py`, no server or AWS):
+
+- replaying a request adds no rows: `test_asking_again_while_paused_adds_no_rows`, `test_asking_again_after_filing_reuses_it`;
+- a pending approval survives a restart: `test_the_approval_survives_a_restart`;
+- the write gate needs a recorded approval: `test_the_gate_never_files_without_an_approved_row`, `test_a_go_ahead_message_cannot_approve`.
+
+`W-S-01` turn 4 reuses `AR001` and files nothing, as the spec's reference scenario says. `GOLDEN-DATASETS.json` (S8, the same turn) expects a new `create_access_request`; we follow the spec.
 
 ## Running
 
-From the project root (needs Lesson 10's MCP server running on 127.0.0.1:9877):
+From the project root. First the tool server (port 9877), and for a graded run a fresh database:
 
 ```
-python -m evals.run_maya_s2            # all 12 S2 turns
+python -m server.reset_db              # with the server stopped: back to the seed data
+python -m server.server                # serves the tools at http://127.0.0.1:9877/mcp
+```
+
+Then, in another terminal:
+
+```
+python -m evals.run_maya_s2            # all 12 S2 turns (M-S-01 has the same messages)
 python -m evals.run_maya_s2 --turns 3  # a quick run
+python -m evals.run_webex              # W-I-01..03, W-S-01's 4 turns, W-I-03 again
+python -m webex.approve AP005 --as E018 --decision approved   # decide a waiting approval
 ```
 
 `-m` makes Python import from the project root, so `maya` is found.
 
-Each run writes `runs/maya_s2_<date-time>.json` (one record per turn: answer, checklist, source IDs, tool calls, handoffs, error, checks) and a full log, `runs/maya_s2.log`. A crashed turn is recorded and the run goes on. The exit code is 1 if any turn or the turn-10 replay failed. `runs/` isn't committed: it holds employee data.
+Each run writes `runs/maya_s2_<date-time>.json` (one record per turn: answer, checklist, source IDs, tool calls, handoffs, error, checks) and a full log, `runs/maya_s2.log`. A crashed turn is recorded and the run goes on. The exit code is 1 if any turn or the turn-10 replay failed. Each turn's summary shows its route (`maya`, `webex` or `handoff`) and the tools Webex called.
+
+`evals/run_webex.py` does the same for the Webex inputs (`data/EVALUATION-INPUTS.yaml`), checked in `evals/webex_checks.py`: who answered, the required facts, never "granted", and no rows added (counted before and after each message). It writes `runs/webex.log` and `runs/webex_<date-time>.json`.
+
+`runs/` isn't committed: it holds employee data.
