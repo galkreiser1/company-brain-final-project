@@ -31,6 +31,7 @@ from typing import Annotated, TypedDict
 
 from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langfuse.langchain import CallbackHandler
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -593,6 +594,9 @@ def build_graph(tools: list, retriever: EvidenceRetriever, webex: WebexPort):
 
     # The checkpointer saves the state per conversation (thread_id) between turns, so
     # each turn starts with the messages of all earlier turns.
-    # with_config sets the limit on every run, so callers don't have to remember it.
+    # with_config sets these on every run, so callers don't have to remember them:
+    #   - the step limit;
+    #   - Langfuse's callback. LangGraph tells it each time a node, model or tool call
+    #     starts and ends, and it records them as one trace per run.
     compiled = graph.compile(checkpointer=InMemorySaver())
-    return compiled.with_config(recursion_limit=RECURSION_LIMIT)
+    return compiled.with_config(recursion_limit=RECURSION_LIMIT, callbacks=[CallbackHandler()])

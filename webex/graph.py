@@ -23,6 +23,7 @@ from typing import TypedDict
 
 import aiosqlite
 from contextlib import asynccontextmanager
+from langfuse.langchain import CallbackHandler
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
@@ -322,7 +323,9 @@ def build_graph(toolbox: Toolbox, retriever: EvidenceRetriever, answer_model=Non
     graph.add_conditional_edges("respond", after_respond, {"wait": "wait", END: END})
     graph.add_conditional_edges("wait", by_approval, approval_routes)
     graph.add_edge("file_request", "respond")
-    return graph.compile(checkpointer=checkpointer)
+    # Langfuse's callback, bound to the graph: every run is traced, with each node as
+    # its own step, and no caller has to pass it in. Also when run alone (webex.approve).
+    return graph.compile(checkpointer=checkpointer).with_config(callbacks=[CallbackHandler()])
 
 
 @asynccontextmanager

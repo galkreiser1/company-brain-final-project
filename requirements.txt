@@ -12,6 +12,7 @@ langchain-aws             # ChatBedrockConverse — LangChain's wrapper over Bed
 langgraph                 # StateGraph, checkpointer, conditional edges — every stage
 langgraph-checkpoint-sqlite  # saves paused Webex runs to a file (AsyncSqliteSaver)
 langchain-mcp-adapters    # load the MCP server's tools as LangChain tools
+langfuse>=4.10,<5         # traces every run (Lesson 11); keys in .env
 opensearch-py
 pytest
 pyyaml                    # reads data/EVALUATION-INPUTS.yaml (evals/run_webex.py)

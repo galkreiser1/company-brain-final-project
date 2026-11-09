@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import sys
 
+from langfuse import get_client
 from langgraph.types import Command
 
 from maya.retrieval import OpenSearchRetriever
@@ -51,6 +52,9 @@ def main() -> None:
     parser.add_argument("--reason", default="")
     args = parser.parse_args()
     asyncio.run(approve(args.approval_id, args.approver_id, args.decision, args.reason))
+    # Langfuse sends traces in batches from a background thread. Flush before exiting,
+    # or the last ones are lost.
+    get_client().flush()
 
 
 if __name__ == "__main__":

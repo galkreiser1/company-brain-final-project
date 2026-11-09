@@ -26,6 +26,7 @@ from datetime import datetime
 
 import yaml
 from langchain_core.messages import HumanMessage
+from langfuse import get_client
 
 from evals.run_maya_s2 import describe_checks, describe_tool_call, load_tools, one_line, turn_route
 from evals.webex_checks import COUNTED_TABLES, EXPECTED, check_input
@@ -215,4 +216,8 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    exit_code = asyncio.run(main())
+    # Langfuse sends traces in batches from a background thread. Flush before exiting,
+    # or the last ones are lost.
+    get_client().flush()
+    sys.exit(exit_code)

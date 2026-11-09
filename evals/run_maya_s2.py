@@ -25,6 +25,7 @@ from pathlib import Path
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage
+from langfuse import get_client
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from maya.config import MCP_SERVER_URL, REPO_ROOT
@@ -768,4 +769,8 @@ async def run_session(tools: list, retriever: RecordingRetriever, webex: Recordi
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main(turns_to_run())))
+    exit_code = asyncio.run(main(turns_to_run()))
+    # Langfuse sends traces in batches from a background thread. Flush before exiting,
+    # or the last ones are lost.
+    get_client().flush()
+    sys.exit(exit_code)
