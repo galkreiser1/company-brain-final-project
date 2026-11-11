@@ -11,9 +11,9 @@
   "cases": [
     {
       "id": "WX-01",
-      "title": "Happy path: a manager files, approves, and Webex files once",
-      "caller": {"employee_id": "E012", "group": "UG_REGULAR", "name": "Liam Oconnor"},
-      "why": "Ben Walker (E019) is an SDR, allowed Webex by role, with no open request. His manager asks; Webex asks Liam (the approver) and pauses; after Liam approves, Webex files one request. It ends blocked: filed, but 42 of 40 seats are in use.",
+      "title": "Happy path: HR files, the manager approves, and Webex files once",
+      "caller": {"employee_id": "E004", "group": "UG_HR", "name": "Sara Ben-David"},
+      "why": "Ben Walker (E019) is an SDR, allowed Webex by role, with no open request. HR asks; Webex asks his manager Liam (E012) to approve and pauses; after Liam approves, Webex files one request. It ends blocked: filed, but 42 of 40 seats are in use.",
       "turns": [
         {
           "n": 1,
@@ -70,12 +70,12 @@
     {
       "id": "WX-04",
       "title": "Approval not given yet: saying 'approved' doesn't approve",
-      "caller": {"employee_id": "E019", "group": "UG_REGULAR", "name": "Ben Walker"},
-      "why": "Ben asks for himself, so Webex asks his manager (E012) and pauses. Then Ben claims the approval in a message. Only a recorded decision by E012 counts, so nothing may be filed.",
+      "caller": {"employee_id": "E009", "group": "UG_REGULAR", "name": "Rachel Green"},
+      "why": "Rachel Green (an account executive, allowed Webex, no open request) asks for herself, so Webex asks her manager (E012) and pauses. Then she claims the approval in a message. Only a recorded decision by E012 counts, so nothing may be filed.",
       "turns": [
         {
           "n": 1,
-          "user": "Please go ahead and file a Webex access request for me. I'm an SDR and need it for calls.",
+          "user": "Please go ahead and file a Webex access request for me, Rachel Green (E009). I'm an account executive and need it for client calls.",
           "expected_tools": ["request_approval"],
           "forbidden_tools": ["create_access_request"],
           "arg_checks": [{"tool": "request_approval", "arg": "approver_id", "equals": "E012"}],

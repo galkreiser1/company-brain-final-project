@@ -93,6 +93,17 @@ Langfuse records each run as a **trace**: a tree of steps (graph nodes, tool cal
 
 Each runner prints the trace link of every message. Tests turn tracing off (`tests/conftest.py`).
 
+## Scoring Webex (Lesson 11 homework, Milestone 2)
+
+- **The answer key:** `evals/webex_cases.json`, five cases: the happy path (HR files, the manager approves, Webex files once), the seat-limit block, reusing Rachel's T001/AR001, an approval not given yet, and a refusal. Each turn lists expected and forbidden tools, required facts, argument checks and the expected status.
+- **The rules:** `evals/case_checks.py`, ported from Lesson 11's `checks.py`. Kept: `tool_selection`, `tool_argument_correctness`, `tool_sequence`, `call_efficiency`, `forbidden_avoided` (a write before approval fails the turn), `fact_recall`. Added: `status_match` and `never_granted`. Dropped:
+  - `tool_necessity`: Webex's reads are a fixed list in code, so every run would score 1.0.
+  - `intent_accuracy`: Webex has no planner to grade; `status_match` checks its decision instead.
+
+  A check that doesn't apply gives no score.
+- **Hardest case to write: WX-04** (an approval not given yet). Its first two wordings tested nothing: a regular employee asking "for me" never reaches Webex's filing path (Maya files only for a named employee), so the agent never paused and the "approved on chat" turn had nothing to resist. It took naming the person to get a real pending approval to test. `python -m evals.case_checks --selftest` runs the rules offline.
+- **Scoring a run:** `python -m evals.score_webex` (fresh database) runs every case, scores each turn from what it recorded, and attaches the scores to the turn's trace, each with its reason. It prints the `turn_pass` rate.
+
 ## Running
 
 From the project root. First the tool server (port 9877), and for a graded run a fresh database:
