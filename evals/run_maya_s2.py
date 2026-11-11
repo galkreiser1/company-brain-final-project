@@ -37,6 +37,7 @@ from maya.planning import ASSISTANT_PROMPT, IMPORTANT_POINTERS, message_text, re
 from maya.respond import tool_result_ids
 from maya.retrieval import OpenSearchRetriever
 from evals.s2_checks import check_handoff, check_homework_rules, check_turn, turn_handoffs
+from evals.tracing import RUN_STAMP, finish_turn, require_langfuse, traced_turn, turn_status
 from evals.webex_recording import RecordingWebexPort, real_webex_port
 
 
@@ -240,6 +241,27 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
         # The messages the memory doesn't cover yet: what the next check counts.
         "fresh": messages[result.get("distilled_upto", 0):],
     }
+
+
+async def run_traced_turn(graph, config: dict, recorder: ModelCallRecorder, number: int,
+                          turn: dict, retriever: RecordingRetriever, webex: RecordingWebexPort,
+                          caller_id: str) -> dict:
+    """run_turn_safely inside its own Langfuse trace, labelled "S2 turn N"."""
+
+    first_result = len(webex.results)
+    with traced_turn(
+        f"S2 turn {number}", turn["user"], conversation=SESSION_ID, user_id=caller_id,
+        tags=["s2-runner", "S2"], metadata={"case_id": "S2", "turn": str(number)},
+    ) as root:
+        outcome = await run_turn_safely(graph, config, recorder, turn, retriever, webex)
+        refused = outcome["answer"] == REFUSAL
+        outcome["trace_url"] = finish_turn(root, outcome["answer"], {
+            "status": "error" if outcome["error"] else turn_status(refused, webex.results[first_result:]),
+            "route": outcome["route"],
+            "intent": (outcome.get("plan") or {}).get("current_intent"),
+            "passed": turn_passed(outcome),
+        })
+    return outcome
 
 
 async def run_turn_safely(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
@@ -708,6 +730,7 @@ async def replay_handoff_turn(graph, config: dict, turn: dict, webex: RecordingW
 async def main(turn_count: int) -> int:
     """Run the turns, save the record, and return the exit code: 1 if anything failed."""
 
+    require_langfuse()
     tools = await load_tools()
     retriever = RecordingRetriever(OpenSearchRetriever())
     # The real Webex workflow, recorded. Its own searches use the plain retriever, so
@@ -734,7 +757,7 @@ async def run_session(tools: list, retriever: RecordingRetriever, webex: Recordi
     }
     turns = session["turns"][:turn_count]
     print(f"S2 runner: {SESSION_ID}, turns 1-{len(turns)} · {len(tools)} tools from MCP, Maya loads {TOOL_COUNT} · "
-          f"caller {session['caller_id']} ({session['caller_group']})")
+          f"caller {session['caller_id']} ({session['caller_group']}) · Langfuse run {RUN_STAMP}")
 
     LOG_FILE.parent.mkdir(exist_ok=True)
     passed = 0
@@ -742,13 +765,16 @@ async def run_session(tools: list, retriever: RecordingRetriever, webex: Recordi
     with LOG_FILE.open("w") as log:
         log.write(log_header(len(tools)))
         for number, turn in enumerate(turns, start=1):
-            outcome = await run_turn_safely(graph, config, recorder, turn, retriever, webex)
+            outcome = await run_traced_turn(graph, config, recorder, number, turn, retriever,
+                                            webex, session["caller_id"])
             if outcome["error"]:
                 print(describe_error_turn(number, outcome))
                 log.write("\n" + describe_error_turn(number, outcome) + "\n")
             else:
                 print_turn(number, outcome)
                 log.write(log_turn(number, outcome, len(tools)))
+            print(f"  trace: {outcome['trace_url'] or '(none)'}")
+            log.write(f"TRACE {outcome['trace_url'] or '(none)'}\n")
             passed += turn_passed(outcome)
             records.append(turn_record(number, outcome))
 
@@ -759,7 +785,14 @@ async def run_session(tools: list, retriever: RecordingRetriever, webex: Recordi
 
     replay_passed = None
     if turn_count >= HANDOFF_TURN:
-        replay_passed = await replay_handoff_turn(graph, config, turns[HANDOFF_TURN - 1], webex)
+        replay = turns[HANDOFF_TURN - 1]
+        with traced_turn(
+            f"S2 turn {HANDOFF_TURN} (again)", replay["user"], conversation=SESSION_ID,
+            user_id=session["caller_id"], tags=["s2-runner", "S2"],
+            metadata={"case_id": "S2", "turn": f"{HANDOFF_TURN}-replay"},
+        ) as root:
+            replay_passed = await replay_handoff_turn(graph, config, replay, webex)
+            print(f"  trace: {finish_turn(root, '', {'passed': replay_passed})}")
 
     print(f"Run record: {save_run(records, replay_passed).relative_to(REPO_ROOT)}")
     failures = failure_lines(records, replay_passed)

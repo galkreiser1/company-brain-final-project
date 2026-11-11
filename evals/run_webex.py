@@ -14,7 +14,8 @@ Maya answers or passes it to the Webex workflow (webex/).
 The checks live in evals/webex_checks.py.
 
 Outputs: a short summary per input in the terminal, everything in full in
-runs/webex.log, and a JSON record in runs/webex_<YYYYmmdd-HHMMSS>.json.
+runs/webex.log, a JSON record in runs/webex_<YYYYmmdd-HHMMSS>.json, and one Langfuse
+trace per input (its link is printed), tagged with the case id and turn.
 Exit code 1 if any check failed.
 """
 
@@ -22,7 +23,6 @@ import asyncio
 import json
 import sqlite3
 import sys
-from datetime import datetime
 
 import yaml
 from langchain_core.messages import HumanMessage
@@ -30,6 +30,7 @@ from langfuse import get_client
 
 from evals.run_maya_s2 import describe_checks, describe_tool_call, load_tools, one_line, turn_route
 from evals.webex_checks import COUNTED_TABLES, EXPECTED, check_input
+from evals.tracing import RUN_STAMP, finish_turn, require_langfuse, traced_turn, turn_status
 from evals.webex_recording import RecordingWebexPort, real_webex_port
 from maya.config import REPO_ROOT
 from maya.graph import REFUSAL, build_graph
@@ -75,11 +76,28 @@ def count_rows() -> dict[str, int]:
 
 
 async def run_case(graph, webex: RecordingWebexPort, case: dict) -> dict:
+    """Send one message inside its own trace, then collect what happened and check it."""
+
+    with traced_turn(
+        case_name(case), case["message"], conversation=case["thread_id"],
+        user_id=case["caller"]["employee_id"], tags=["webex-runner", case["id"]],
+        metadata={"case_id": case["id"], "turn": str(case["turn"] or 1)},
+    ) as root:
+        outcome = await run_and_check(graph, webex, case)
+        # The trace's output is the answer; the metadata is what a reviewer reads first.
+        outcome["trace_url"] = finish_turn(root, outcome["answer"], {
+            "status": outcome["status"], "route": outcome["route"],
+            "passed": passed(outcome), "rows_added": outcome["rows_added"],
+        })
+    return outcome
+
+
+async def run_and_check(graph, webex: RecordingWebexPort, case: dict) -> dict:
     """Send one message, then collect what happened and check it."""
 
     before = count_rows()
     first_question, first_handoff = len(webex.questions), len(webex.calls)
-    first_tool = len(webex.tool_calls)
+    first_tool, first_result = len(webex.tool_calls), len(webex.results)
     caller = case["caller"]
     config = {"configurable": {
         "thread_id": case["thread_id"],
@@ -102,6 +120,7 @@ async def run_case(graph, webex: RecordingWebexPort, case: dict) -> dict:
                              for c in reply.get("citations", [])}),
         "handoff_results": handoff_results,
         "webex_tool_calls": webex.tool_calls[first_tool:],
+        "status": turn_status(answer == REFUSAL, webex.results[first_result:]),
         "rows_added": {table: after[table] - before[table] for table in COUNTED_TABLES},
         "error": None,
     }
@@ -115,7 +134,8 @@ async def run_case_safely(graph, webex: RecordingWebexPort, case: dict) -> dict:
     try:
         return await run_case(graph, webex, case)
     except Exception as error:
-        return {"answer": "", "intent": "?", "route": "?", "citations": [], "handoff_results": [],
+        return {"answer": "", "intent": "?", "route": "?", "status": "error",
+                "citations": [], "handoff_results": [], "trace_url": None,
                 "webex_tool_calls": [], "rows_added": {}, "error": f"{type(error).__name__}: {error}",
                 "checks": [("finished without error", False)]}
 
@@ -143,11 +163,13 @@ def print_case(case: dict, outcome: dict) -> None:
     webex_tools = ", ".join(call["name"] for call in outcome["webex_tool_calls"]) or "(none)"
     print(f"\n{case_name(case)}  {'PASS' if passed(outcome) else 'FAIL'}  "
           f"{one_line(case['message'], 70, count_dropped=False)}")
-    print(f"  route:  {outcome['route']} · intent {outcome['intent']} · rows added: {rows}")
+    print(f"  route:  {outcome['route']} · status {outcome['status']} · intent {outcome['intent']} "
+          f"· rows added: {rows}")
     print(f"  webex tools: {webex_tools}")
     print(f"  cites:  {', '.join(outcome['citations']) or '(none)'}")
     print(f"  checks: {describe_checks(outcome['checks'])}")
     print(f"  answer: {outcome['error'] or one_line(outcome['answer'], 90, count_dropped=False)}")
+    print(f"  trace:  {outcome['trace_url'] or '(none)'}")
 
 
 def log_case(case: dict, outcome: dict) -> str:
@@ -157,7 +179,8 @@ def log_case(case: dict, outcome: dict) -> str:
     lines = [f"\n{rule}", f"{case_name(case)}  ·  {'PASS' if passed(outcome) else 'FAIL'}", rule,
              f"CALLER   {case['caller']['name']} ({case['caller']['employee_id']}, "
              f"{case['caller']['group']})", "MESSAGE", case["message"],
-             f"ROUTE    {outcome['route']} (intent {outcome['intent']})",
+             f"ROUTE    {outcome['route']} (intent {outcome['intent']}, status {outcome['status']})",
+             f"TRACE    {outcome['trace_url'] or '(none)'}",
              "WEBEX TOOLS " + ("\n  ".join(describe_tool_call(c) for c in outcome["webex_tool_calls"])
                                or "(none)"),
              f"HANDOFFS {outcome['handoff_results'] or '(none)'}",
@@ -171,7 +194,7 @@ def log_case(case: dict, outcome: dict) -> str:
 def save_run(cases: list[dict], outcomes: list[dict]):
     """Write the whole run to runs/webex_<YYYYmmdd-HHMMSS>.json. Returns its path."""
 
-    path = RUNS_DIR / f"webex_{datetime.now():%Y%m%d-%H%M%S}.json"
+    path = RUNS_DIR / f"webex_{RUN_STAMP}.json"
     records = [
         {"case": case_name(case), "caller": case["caller"], "message": case["message"],
          **{k: v for k, v in outcome.items() if k != "checks"},
@@ -187,10 +210,11 @@ def save_run(cases: list[dict], outcomes: list[dict]):
 async def main() -> int:
     """Run every case, save the record, and return the exit code: 1 if anything failed."""
 
+    require_langfuse()
     tools = await load_tools()
     cases = load_cases()
     print(f"Webex runner: {len(cases)} messages from {EVALUATION_INPUTS.relative_to(REPO_ROOT)} · "
-          f"rows now: {count_rows()}")
+          f"rows now: {count_rows()} · Langfuse run {RUN_STAMP}")
     outcomes = []
     async with real_webex_port(tools, OpenSearchRetriever()) as webex:
         graph = build_graph(tools, OpenSearchRetriever(), webex)

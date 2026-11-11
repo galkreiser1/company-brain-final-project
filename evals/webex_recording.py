@@ -29,6 +29,7 @@ class RecordingWebexPort:
         self.toolbox = toolbox
         self.calls = []      # WebexHandoff: what Maya filed (same name as FakeWebexPort's)
         self.questions = []  # WebexQuestion: what Maya asked
+        self.results = []    # PendingAccessResult: what Webex answered, to either
 
     @property
     def tool_calls(self) -> list[dict]:
@@ -36,11 +37,15 @@ class RecordingWebexPort:
 
     async def request_access(self, handoff):
         self.calls.append(handoff)
-        return await self.port.request_access(handoff)
+        result = await self.port.request_access(handoff)
+        self.results.append(result)
+        return result
 
     async def ask(self, question):
         self.questions.append(question)
-        return await self.port.ask(question)
+        result = await self.port.ask(question)
+        self.results.append(result)
+        return result
 
 
 @asynccontextmanager

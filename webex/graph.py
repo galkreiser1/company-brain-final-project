@@ -323,9 +323,11 @@ def build_graph(toolbox: Toolbox, retriever: EvidenceRetriever, answer_model=Non
     graph.add_conditional_edges("respond", after_respond, {"wait": "wait", END: END})
     graph.add_conditional_edges("wait", by_approval, approval_routes)
     graph.add_edge("file_request", "respond")
-    # Langfuse's callback, bound to the graph: every run is traced, with each node as
-    # its own step, and no caller has to pass it in. Also when run alone (webex.approve).
-    return graph.compile(checkpointer=checkpointer).with_config(callbacks=[CallbackHandler()])
+    # No Langfuse callback here: Maya's graph has one, and a graph run inside a Maya node
+    # inherits it, so Webex's steps are traced under Maya's handoff/webex step. A second
+    # callback here would record every Webex step twice. webex.approve, which runs Webex
+    # without Maya, passes its own (traced_run_config).
+    return graph.compile(checkpointer=checkpointer)
 
 
 @asynccontextmanager
@@ -346,6 +348,11 @@ async def request_key_for(toolbox: Toolbox, request: WebexRequest) -> str:
 def run_config(request_key: str) -> dict:
     """LangGraph saves and finds a run by its thread_id: here, the request key."""
     return {"configurable": {"thread_id": request_key}}
+
+
+def traced_run_config(request_key: str) -> dict:
+    """run_config plus Langfuse's callback, for a Webex run that Maya didn't start."""
+    return {**run_config(request_key), "callbacks": [CallbackHandler()]}
 
 
 async def run_webex(graph, toolbox: Toolbox, request: WebexRequest) -> AccessDecision:

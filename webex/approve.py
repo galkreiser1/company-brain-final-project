@@ -12,7 +12,7 @@ from langfuse import get_client
 from langgraph.types import Command
 
 from maya.retrieval import OpenSearchRetriever
-from webex.graph import build_graph, open_checkpointer, run_config
+from webex.graph import build_graph, open_checkpointer, traced_run_config
 from webex.tools import ToolError, load_mcp_toolbox
 
 
@@ -30,7 +30,7 @@ async def approve(approval_id: str, approver_id: str, decision: str, reason: str
     print(f"{approval_id} is now {row['status']}.")
 
     # A new approval's request_id is the request key the waiting run is saved under.
-    config = run_config(row["request_id"])
+    config = traced_run_config(row["request_id"])
     async with open_checkpointer() as saver:
         graph = build_graph(toolbox, OpenSearchRetriever(), checkpointer=saver)
         if not (await graph.aget_state(config)).interrupts:

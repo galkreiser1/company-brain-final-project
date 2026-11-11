@@ -83,6 +83,16 @@ Proof of the durable behaviour (unit tests in `tests/test_webex_steps.py`, no se
 
 `W-S-01` turn 4 reuses `AR001` and files nothing, as the spec's reference scenario says. `GOLDEN-DATASETS.json` (S8, the same turn) expects a new `create_access_request`; we follow the spec.
 
+## Tracing (Langfuse)
+
+Langfuse records each run as a **trace**: a tree of steps (graph nodes, tool calls, model calls), each with its input, output, time and cost. Keys go in `.env` (`LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL`).
+
+- **Every step, with no caller code.** Langfuse's callback is bound to Maya's compiled graph (`build_graph` in `maya/graph.py`). Webex runs inside Maya's `handoff` or `webex` node, inherits that callback, and its steps (`lookup`, `decide`, `request_approval`, `wait`, …) show nested under that node. `webex.approve`, which resumes Webex without Maya, passes its own (`traced_run_config` in `webex/graph.py`).
+- **One labelled trace per message.** Both runners wrap each message in `traced_turn` (`evals/tracing.py`): a root step named after the case ("W-I-03", "S2 turn 10") with the message as input and the answer as output, plus a session per conversation, the caller as user, and `case_id`, `turn` and `run` as metadata. The root's metadata also holds `status` (Webex's own, or `answered`/`refused`), `route` and `passed`.
+- **Where to look.** Webex's decision is its own step, `decide`; its output `path` is the choice (`reuse`, `approve_then_file`, …). The approval pause is the `request_approval` and `wait` steps. Maya's memory updates are the `distil` step.
+
+Each runner prints the trace link of every message. Tests turn tracing off (`tests/conftest.py`).
+
 ## Running
 
 From the project root. First the tool server (port 9877), and for a graded run a fresh database:
