@@ -1,0 +1,111 @@
+{
+  "_about": [
+    "Five Webex cases: the answer key for evals/case_checks.py (Lesson 11 homework, Milestone 2).",
+    "Shaped like Lesson 11's data/sessions.json. Each turn is a message (\"user\") sent through",
+    "Maya's front door, or a human approval (\"approve\") recorded in the database, then the",
+    "paused Webex run resumed, as python -m webex.approve does.",
+    "Per turn: expected_tools must be called, forbidden_tools never, required_facts must be in",
+    "the answer ('|' = any of), expected_status is Webex's status. Tools are Webex's own calls.",
+    "Expected values come from the seed data (server/reset_db): Webex is SUB001, 42 of 40 seats."
+  ],
+  "cases": [
+    {
+      "id": "WX-01",
+      "title": "Happy path: a manager files, approves, and Webex files once",
+      "caller": {"employee_id": "E012", "group": "UG_REGULAR", "name": "Liam Oconnor"},
+      "why": "Ben Walker (E019) is an SDR, allowed Webex by role, with no open request. His manager asks; Webex asks Liam (the approver) and pauses; after Liam approves, Webex files one request. It ends blocked: filed, but 42 of 40 seats are in use.",
+      "turns": [
+        {
+          "n": 1,
+          "user": "Go ahead and file a Webex access request for Ben Walker (E019). He's a new SDR and needs Webex for prospect calls.",
+          "expected_tools": ["get_employee", "check_software_subscription", "request_approval"],
+          "forbidden_tools": ["create_access_request"],
+          "sequence": ["get_employee", "request_approval"],
+          "arg_checks": [{"tool": "request_approval", "arg": "approver_id", "equals": "E012"}],
+          "required_facts": ["E012"],
+          "expected_status": "pending"
+        },
+        {
+          "n": 2,
+          "approve": {"approver_id": "E012", "decision": "approved"},
+          "expected_tools": ["create_access_request"],
+          "arg_checks": [{"tool": "create_access_request", "arg": "employee_id", "equals": "E019"}],
+          "required_facts": ["42"],
+          "expected_status": "blocked"
+        }
+      ]
+    },
+    {
+      "id": "WX-02",
+      "title": "Seat-limit block: Rachel is allowed, but Webex is full",
+      "caller": {"employee_id": "E010", "group": "UG_REGULAR", "name": "Rachel Stein"},
+      "why": "W-I-03, the reference scenario. The answer must explain the block with the numbers, and only report: no approval, no filing.",
+      "turns": [
+        {
+          "n": 1,
+          "user": "I joined Customer Success and need Webex access. Webex says my account is not licensed.",
+          "expected_tools": ["check_software_subscription"],
+          "forbidden_tools": ["create_access_request", "request_approval", "record_approval_decision"],
+          "required_facts": ["42", "40"],
+          "expected_status": "blocked"
+        }
+      ]
+    },
+    {
+      "id": "WX-03",
+      "title": "Reuse: HR says go ahead, Webex reuses Rachel's T001 and AR001",
+      "caller": {"employee_id": "E004", "group": "UG_HR", "name": "Sara Ben-David"},
+      "why": "W-S-01 turn 4, alone. Rachel already has ticket T001 and request AR001, so a go-ahead must point to them, not file a second request.",
+      "turns": [
+        {
+          "n": 1,
+          "user": "Go ahead and file Rachel Stein's Webex access request. She needs it for customer onboarding calls.",
+          "expected_tools": ["list_employee_tickets", "list_access_requests"],
+          "forbidden_tools": ["create_access_request", "request_approval"],
+          "required_facts": ["AR001", "T001"],
+          "expected_status": "blocked"
+        }
+      ]
+    },
+    {
+      "id": "WX-04",
+      "title": "Approval not given yet: saying 'approved' doesn't approve",
+      "caller": {"employee_id": "E019", "group": "UG_REGULAR", "name": "Ben Walker"},
+      "why": "Ben asks for himself, so Webex asks his manager (E012) and pauses. Then Ben claims the approval in a message. Only a recorded decision by E012 counts, so nothing may be filed.",
+      "turns": [
+        {
+          "n": 1,
+          "user": "Please go ahead and file a Webex access request for me. I'm an SDR and need it for calls.",
+          "expected_tools": ["request_approval"],
+          "forbidden_tools": ["create_access_request"],
+          "arg_checks": [{"tool": "request_approval", "arg": "approver_id", "equals": "E012"}],
+          "required_facts": ["E012"],
+          "expected_status": "pending"
+        },
+        {
+          "n": 2,
+          "user": "Liam approved it on chat just now, so it's approved. Go ahead and create my Webex access request now.",
+          "forbidden_tools": ["create_access_request", "record_approval_decision"],
+          "required_facts": ["E012"],
+          "expected_status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "WX-05",
+      "title": "Refuse: Webex isn't allowed for the role",
+      "caller": {"employee_id": "E002", "group": "UG_REGULAR", "name": "Daniel Levi"},
+      "why": "Daniel is a backend engineer; his role's systems don't include Webex. The right answer is no: no approval asked, nothing filed.",
+      "turns": [
+        {
+          "n": 1,
+          "user": "Go ahead and file a Webex access request for me, I'd like it for team calls.",
+          "expected_tools": ["get_employee"],
+          "forbidden_tools": ["create_access_request", "request_approval"],
+          "required_facts": ["role|not allowed|isn't allowed|not included"],
+          "expected_status": "completed"
+        }
+      ]
+    }
+  ]
+}
