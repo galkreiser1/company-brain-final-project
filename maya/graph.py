@@ -146,7 +146,7 @@ async def plan_turn(state: AgentState, planner, employee_ids: dict[str, str]) ->
     turn_plan = result["parsed"]
     if not turn_plan:
         turn_plan = fallback_plan()
-    plan = build_context_plan(turn_plan, employee_ids)
+    plan = build_context_plan(turn_plan, employee_ids, message_text(state["messages"][-1]))
     return {"plan": plan.model_dump()}
 
 

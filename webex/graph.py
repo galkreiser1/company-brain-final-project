@@ -58,6 +58,7 @@ SEARCH_COLLECTIONS = ["it_kb", "policies", "contracts", "internal_memos"]
 
 class WebexState(TypedDict, total=False):
     request: WebexRequest
+    subscriptions: list     # check_software_subscription's result, read once by run_webex
     records: dict           # the read tools' results, by name
     problem: str | None     # why the run can't go on, e.g. "No employee E999."
     evidence: list[Evidence]
@@ -83,7 +84,11 @@ async def lookup(state: WebexState, toolbox: Toolbox) -> dict:
     if not employee:
         return {"problem": f"No employee {request.employee_id}."}
 
-    subscriptions = await toolbox.call("check_software_subscription", software=request.software)
+    # run_webex already read the subscription to name the run; read it here only if
+    # the graph was started some other way (the tests).
+    subscriptions = state.get("subscriptions")
+    if subscriptions is None:
+        subscriptions = await toolbox.call("check_software_subscription", software=request.software)
     if len(subscriptions) != 1:
         return {"problem": f"No single subscription matches {request.software!r}."}
 
@@ -337,10 +342,9 @@ async def open_checkpointer():
         yield AsyncSqliteSaver(conn, serde=CHECKPOINT_SERDE)
 
 
-async def request_key_for(toolbox: Toolbox, request: WebexRequest) -> str:
+def request_key_for(request: WebexRequest, subscriptions: list) -> str:
     """e.g. "webex-E001-S001". Falls back to the software name if it matches no
     single subscription (the run then stops at lookup anyway)."""
-    subscriptions = await toolbox.call("check_software_subscription", software=request.software)
     system_id = subscriptions[0]["system_id"] if len(subscriptions) == 1 else request.software
     return make_request_key(request.employee_id, system_id)
 
@@ -360,6 +364,11 @@ async def run_webex(graph, toolbox: Toolbox, request: WebexRequest) -> AccessDec
 
     Asking again lands on the same saved run and starts it over from lookup, so it
     sees what's in the database now: the approval it already asked for is reused."""
-    config = run_config(await request_key_for(toolbox, request))
-    final_state = await graph.ainvoke({"request": request, "approval": None, "filed": None}, config)
+    # One subscription read both names the run and feeds lookup, so it isn't read twice.
+    subscriptions = await toolbox.call("check_software_subscription", software=request.software)
+    config = run_config(request_key_for(request, subscriptions))
+    final_state = await graph.ainvoke(
+        {"request": request, "subscriptions": subscriptions, "approval": None, "filed": None},
+        config,
+    )
     return final_state["decision"]

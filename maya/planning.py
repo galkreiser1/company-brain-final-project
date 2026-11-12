@@ -1,6 +1,7 @@
 """What each model call receives: the prompts, the plan, and the messages built from the state."""
 
 import json
+import re
 from typing import Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -209,10 +210,25 @@ def match_employee_name(name: str, employee_ids: dict[str, str]) -> str | None:
     return close[0] if len(close) == 1 else None
 
 
-def build_context_plan(turn_plan: TurnPlan, employee_ids: dict[str, str]) -> ContextPlan:
+def misspells_name(text: str, name: str) -> bool:
+    """True if `text` has `name` misspelled: words that are each at most one letter off
+    and not all exact ("rrachel stein" for "Rachel Stein"). A text that doesn't name the
+    person at all ("her checklist") doesn't misspell it."""
+    wanted = name.lower().split()
+    words = re.findall(r"[a-z]+", text.lower())
+    for start in range(len(words) - len(wanted) + 1):
+        window = words[start:start + len(wanted)]
+        if window != wanted and all(within_one_letter(w, n) for w, n in zip(window, wanted)):
+            return True
+    return False
+
+
+def build_context_plan(turn_plan: TurnPlan, employee_ids: dict[str, str],
+                       user_message: str = "") -> ContextPlan:
     """Add the code-filled fields to the planner's plan.
 
-    Gets: the planner's TurnPlan, and {full name: employee id} (load_employee_ids).
+    Gets: the planner's TurnPlan, {full name: employee id} (load_employee_ids), and
+    the user's message.
     Returns: the ContextPlan.
       - subject_employee_id: the id of the employee subject_name means
         (match_employee_name: exact, or each word one letter off). None if there's no
@@ -229,7 +245,13 @@ def build_context_plan(turn_plan: TurnPlan, employee_ids: dict[str, str]) -> Con
         required = list(REQUIRED_COLLECTIONS.get(turn_plan.current_intent, []))
 
     fields = turn_plan.model_dump()
-    corrected = bool(matched_name) and matched_name.lower() != turn_plan.subject_name.strip().lower()
+    # Misspelled if the planner's name was off, or if the message itself misspells it:
+    # the planner often fixes "rrachel stein" to "Rachel Stein" itself, while the answer
+    # model still sees (and looks up) the message as typed.
+    corrected = bool(matched_name) and (
+        matched_name.lower() != turn_plan.subject_name.strip().lower()
+        or misspells_name(user_message, matched_name)
+    )
     if matched_name:
         fields["subject_name"] = matched_name
     return ContextPlan(**fields, subject_employee_id=subject_id, subject_name_corrected=corrected,

@@ -159,7 +159,7 @@ WRITER_PROMPT = (
 
 async def write_answer(answer_model, request: WebexRequest, decision: AccessDecision) -> str:
     """Ask the model for the reply text, then add the status line, e.g.
-    "Status: blocked (request AR001).".
+    "Status: blocked (request AR001, ticket T001).".
 
     The decision it reads is already final. The status line comes from code, so the
     reply always states where the request really is (e.g. "Status: pending."), and
@@ -171,5 +171,14 @@ async def write_answer(answer_model, request: WebexRequest, decision: AccessDeci
         HumanMessage(f"Reader: {request.caller.caller_id}\nMessage: {request.message}\n\n"
                      f"Decision:\n{json.dumps(facts, indent=1)}"),
     ])
-    about = f" (request {decision.request_id})" if decision.request_id else ""
+    if decision.outcome == "refused":
+        # "completed" alone, or next to a request id, reads like "done"; a refusal
+        # must say nothing was filed.
+        about = " (refused, nothing filed)"
+    elif decision.request_id:
+        # The person's open ticket too (Rachel's T001): the model sometimes leaves it out.
+        tickets = [record for record in decision.existing_records if record.startswith("T")]
+        about = f" (request {', ticket '.join([decision.request_id] + tickets)})"
+    else:
+        about = ""
     return f"{reply.text.strip()}\n\nStatus: {decision.status}{about}."

@@ -43,6 +43,24 @@ def test_the_plan_gets_the_real_name_and_id():
     assert "Rachel Stein (E010)" in render_plan(plan)
 
 
+def test_a_misspelling_the_planner_already_fixed_still_counts():
+    # The planner wrote the real name, but the message (which the answer model sees)
+    # has the typo, so the prompt must still give the id to look up.
+    turn_plan = TurnPlan(current_intent="employee_lookup", needs_documents=False,
+                         needs_records=True, subject_name="Rachel Stein")
+    plan = build_context_plan(turn_plan, EMPLOYEE_IDS, "look up rrachel stein please")
+    assert plan.subject_name_corrected
+    assert "Rachel Stein (E010)" in render_plan(plan)
+
+
+def test_a_message_without_the_name_is_not_a_misspelling():
+    # "her checklist": the planner carries Maya Cohen over, but nothing was misspelled.
+    turn_plan = TurnPlan(current_intent="onboarding_status", needs_documents=False,
+                         needs_records=True, subject_name="Maya Cohen")
+    plan = build_context_plan(turn_plan, EMPLOYEE_IDS, "What's still on her checklist?")
+    assert not plan.subject_name_corrected
+
+
 def test_an_exact_name_changes_nothing_in_the_prompt():
     turn_plan = TurnPlan(current_intent="employee_lookup", needs_documents=False,
                          needs_records=True, subject_name="Maya Cohen")

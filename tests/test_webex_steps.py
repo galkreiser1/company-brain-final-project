@@ -144,9 +144,18 @@ def test_rachel_ends_blocked_and_writes_nothing():
     assert decision.existing_records == ["T001", "AR001", "AP001", "AP002"]
     assert decision.actions_taken == []
     assert [s.split()[0] for s in decision.next_steps] == ["E006", "E011"]
-    assert decision.answer == "Your request AR001 is already on file.\n\nStatus: blocked (request AR001)."
+    assert decision.answer == "Your request AR001 is already on file.\n\nStatus: blocked (request AR001, ticket T001)."
     # The search ran as Rachel, so her own document filter applied.
     assert retriever.queries[0][1] == "E010"
+
+
+def test_a_run_reads_the_subscription_once():
+    # run_webex reads it to name the run, and hands it to lookup instead of a second read.
+    toolbox = DbToolbox()
+    graph = build_graph(toolbox, FakeRetriever(), FakeListChatModel(responses=["ok"]),
+                        checkpointer=InMemorySaver(serde=CHECKPOINT_SERDE))
+    asyncio.run(run_webex(graph, toolbox, webex_request(RACHEL, "E010")))
+    assert toolbox.calls.count("check_software_subscription") == 1
 
 
 def test_rachel_twice_gives_the_same_decision_and_no_new_rows():
@@ -160,6 +169,8 @@ def test_rachel_twice_gives_the_same_decision_and_no_new_rows():
 def test_a_refused_caller_gets_refused():
     decision, _ = run_graph(RACHEL_GREEN, "E010", wants_filing=True)
     assert (decision.status, decision.outcome) == ("completed", "refused")
+    # The status line says it was a refusal, not a finished request.
+    assert decision.answer.endswith("Status: completed (refused, nothing filed).")
 
 
 def test_unknown_employee_skips_search_and_the_model():
