@@ -16,11 +16,13 @@ from webex.tools import McpToolbox
 class RecordingToolbox:
     def __init__(self, toolbox):
         self.toolbox = toolbox
-        self.calls: list[dict] = []  # {"name": ..., "args": {...}}, in order
+        self.calls: list[dict] = []  # {"name": ..., "args": {...}, "result": [...]}, in order
 
     async def call(self, name: str, **args) -> list:
-        self.calls.append({"name": name, "args": args})
-        return await self.toolbox.call(name, **args)
+        call = {"name": name, "args": args, "result": None}
+        self.calls.append(call)  # recorded first, so a call that fails still shows
+        call["result"] = await self.toolbox.call(name, **args)
+        return call["result"]
 
 
 class RecordingWebexPort:

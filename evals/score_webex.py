@@ -34,10 +34,39 @@ from maya.graph import REFUSAL, build_graph
 from maya.retrieval import OpenSearchRetriever
 from server.db import DB_PATH
 from webex.graph import traced_run_config
+from webex.tools import WEBEX_WRITE_TOOLS
 
 CASES_FILE = REPO_ROOT / "evals" / "webex_cases.json"
 RUNS_DIR = REPO_ROOT / "runs"  # not committed: the records hold employee data
 SEED_ACCESS_REQUESTS = 4  # AR001-AR004; more means an earlier run already wrote
+RESULT_CHARS = 1500  # how much of each tool result the judges get; they pay per token
+
+
+# THE EVIDENCE FOR THE JUDGES ----------------------------------------------------------
+# Langfuse's judges (Milestone 3) read only the turn's top step, not the tool steps
+# inside it. So the evidence they grade the answer against is copied onto that step.
+
+def shorten(result) -> str:
+    text = json.dumps(result, default=str)
+    return text if len(text) <= RESULT_CHARS else text[:RESULT_CHARS] + " …[cut]"
+
+
+def evidence_for(tool_calls: list[dict], earlier: list[dict]) -> dict:
+    """What Webex read and what it did this turn, plus what earlier turns read.
+
+    - records_read: every tool result, as the evidence a claim must rest on;
+    - actions_taken: only the writes (approval asked, request filed), so a judge can
+      tell "requested" from "done";
+    - earlier_turns: an answer may repeat what an earlier turn found (WX-04 turn 2
+      runs no tools at all), and that isn't invented.
+    """
+    calls = [{"tool": call["name"], "args": call["args"], "result": shorten(call["result"])}
+             for call in tool_calls]
+    return {
+        "records_read": calls,
+        "actions_taken": [call for call in calls if call["tool"] in WEBEX_WRITE_TOOLS],
+        "earlier_turns": earlier,
+    }
 
 
 # RUN ONE TURN -------------------------------------------------------------------------
@@ -72,7 +101,7 @@ async def approve_and_resume(turn: dict, webex: RecordingWebexPort, waiting: str
 
 
 async def run_turn(graph, case: dict, turn: dict, webex: RecordingWebexPort,
-                   waiting: str | None) -> dict:
+                   waiting: str | None, earlier: list[dict]) -> dict:
     """One turn inside its own trace: run it, score it, attach the scores."""
     label = turn.get("user") or f"approval by {turn['approve']['approver_id']}"
     with traced_turn(f"{case['id']} turn {turn['n']}", label, conversation=case["id"],
@@ -88,8 +117,10 @@ async def run_turn(graph, case: dict, turn: dict, webex: RecordingWebexPort,
         checks = score_turn(turn, outcome["answer"], outcome["tool_calls"], outcome["status"])
         checks |= roll_up({name: score for name, (score, _) in checks.items()})
         outcome["scores"] = checks
+        outcome["evidence"] = evidence_for(outcome["tool_calls"], earlier)
         outcome["trace_url"] = finish_turn(root, outcome["answer"], {
-            "status": outcome["status"], "turn_pass": checks["turn_pass"][0]})
+            "status": outcome["status"], "turn_pass": checks["turn_pass"][0],
+            "evidence": outcome["evidence"]})
         attach_scores(langfuse.get_current_trace_id(), checks)
     return outcome
 
@@ -133,8 +164,10 @@ async def main() -> int:
         graph = build_graph(tools, OpenSearchRetriever(), webex)
         for case in cases:
             waiting = None  # the approval a paused run waits on, for an approval turn
+            earlier = []    # what this case's earlier turns read, for the judges
             for turn in case["turns"]:
-                outcome = await run_turn(graph, case, turn, webex, waiting)
+                outcome = await run_turn(graph, case, turn, webex, waiting, earlier)
+                earlier = earlier + outcome["evidence"]["records_read"]
                 waiting = (webex.results[-1].request_id if webex.results else None)
                 name = f"{case['id']} turn {turn['n']}"
                 print_turn(name, outcome)
