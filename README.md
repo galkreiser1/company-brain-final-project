@@ -154,10 +154,21 @@ python -m evals.run_webex              # W-I-01..03, W-S-01's 4 turns, W-I-03 ag
 python -m webex.approve AP005 --as E018 --decision approved   # decide a waiting approval
 ```
 
+Langfuse (keys in `.env`; every run above is traced and prints its trace links):
+
+```
+python -m evals.case_checks --selftest # the scoring rules, offline (no server, no Langfuse)
+python -m evals.score_webex            # the five cases, scored; scores attached to each trace
+python -m evals.register_judges        # register the two LLM judges (once; --delete removes them)
+python -m evals.build_dashboard        # add or update the scripted dashboard charts
+```
+
 `-m` makes Python import from the project root, so `maya` is found.
 
 Each run writes `runs/maya_s2_<date-time>.json` (one record per turn: answer, checklist, source IDs, tool calls, handoffs, error, checks) and a full log, `runs/maya_s2.log`. A crashed turn is recorded and the run goes on. The exit code is 1 if any turn or the turn-10 replay failed. Each turn's summary shows its route (`maya`, `webex` or `handoff`) and the tools Webex called.
 
 `evals/run_webex.py` does the same for the Webex inputs (`data/EVALUATION-INPUTS.yaml`), checked in `evals/webex_checks.py`: who answered, the required facts, never "granted", and no rows added (counted before and after each message). It writes `runs/webex.log` and `runs/webex_<date-time>.json`.
+
+`evals/score_webex.py` needs a fresh database too (WX-01 files a request), and writes `runs/score_webex_<date-time>.json`.
 
 `runs/` isn't committed: it holds employee data.
