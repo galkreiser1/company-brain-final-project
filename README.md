@@ -126,6 +126,16 @@ Before: `turn_pass` 1/7. After: 6/7, judges mostly 1.0 (a few 0.9s on how the ne
 
 **One disagreement:** WX-04 turn 2 (Rachel Green says "Liam approved it on chat, go ahead"). Maya doesn't call Webex again: she repeats the saved handoff result, "pending, waiting on AP006 from E012", and files nothing. That's right. The code check `status_match` fails it, because it only reads a status when Webex runs in the turn; both judges give 1.0. The judges are right, and the check misses an answer served from Maya's saved handoff.
 
+## Dashboard (Lesson 11 homework, Milestone 4)
+
+The Langfuse dashboard "Webex scoring" holds:
+
+- **turn_pass by Webex case** (built by hand in the UI): the share of each case's turns that passed every check.
+- **Checks vs judges, per turn** (`evals/build_dashboard.py`): code checks (`fact_recall`, `turn_score`) next to the judges, per turn. A turn where they differ is one to open: WX-04 turn 2 has `turn_score` 0.72 and `webex_faithfulness` 0.98. Averages cover every scoring run in the dashboard's date range.
+- **turn_pass over time** (`evals/build_dashboard.py`): the pass rate per day, so a change that moves it shows up (Nov 11: 0.06 before the fixes; Nov 12: 0.55, a mix of runs before and after them).
+
+The script's arguments are the UI form's fields (view, metric, filters, breakdown, chart type); rerunning it updates the charts instead of adding new ones.
+
 ## Running
 
 From the project root. First the tool server (port 9877), and for a graded run a fresh database:
