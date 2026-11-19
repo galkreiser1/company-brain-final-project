@@ -212,12 +212,37 @@ def read_scores(response: dict, count: int) -> dict[int, float]:
     return scores
 
 
-def rerank(query: str, candidates: list[dict]) -> list[tuple[dict, float]]:
-    """Score all candidates in one Nova call, and sort them best first.
+def blend(candidates: list[dict], rerank_scores: dict[int, float]) -> list[tuple[dict, float]]:
+    """Combine both stages into one score, best first.
 
-    Gets: the query and the candidates.
-    Returns: (candidate, score) pairs, best first. A candidate the model skipped
-    scores 0.0, so it sinks to the bottom instead of disappearing.
+    Gets: the candidates in the vector search's order (closest first), and the
+    reranker's score for each (by index).
+    Returns: (candidate, score) pairs, best first, where
+        score = half the reranker's score + half the vector search's position score
+    and the position score is 1.0 for the 1st of n candidates, falling evenly to 1/n
+    for the last.
+
+    Why: the reranker alone sometimes drops the passage that answers the question.
+    Asked about promotions, it scored the "Promotion Process" section 13th of 20
+    while the vector search had it 1st. Neither stage gets the last word: a passage
+    both rank high stays on top, and one ranked 1st by either can't sink to the bottom.
+    """
+
+    count = len(candidates)
+    scores = {
+        i: (rerank_scores.get(i, 0.0) + (count - i) / count) / 2
+        for i in range(count)
+    }
+    order = sorted(range(count), key=lambda i: scores[i], reverse=True)
+    return [(candidates[i], scores[i]) for i in order]
+
+
+def rerank(query: str, candidates: list[dict]) -> list[tuple[dict, float]]:
+    """Score all candidates in one Nova call, then blend with the vector search's order.
+
+    Gets: the query and the candidates, in the vector search's order.
+    Returns: (candidate, score) pairs, best first (see blend). A candidate the model
+    skipped gets 0.0 from the reranker, so only its position score is left.
     """
 
     response = bedrock.converse(
@@ -225,9 +250,7 @@ def rerank(query: str, candidates: list[dict]) -> list[tuple[dict, float]]:
         messages=[{"role": "user", "content": [{"text": rerank_prompt(query, candidates)}]}],
         toolConfig={"tools": [RERANK_TOOL], "toolChoice": {"tool": {"name": "rank"}}},
     )
-    scores = read_scores(response, len(candidates))
-    order = sorted(range(len(candidates)), key=lambda i: scores.get(i, 0.0), reverse=True)
-    return [(candidates[i], scores.get(i, 0.0)) for i in order]
+    return blend(candidates, read_scores(response, len(candidates)))
 
 
 # 4. THE RETRIEVER ------------------------------------------------------------

@@ -9,7 +9,7 @@ config, and the fake retriever writes down every search it's asked to run.
 import pytest
 from langchain_core.messages import HumanMessage
 
-from maya.graph import retrieve
+from maya.graph import USER_WORDS_IN_SEARCH, retrieve, search_text
 from maya.planning import TurnPlan, build_context_plan
 from maya.schemas import CallerContext, Evidence
 
@@ -104,7 +104,8 @@ def test_searches_once_with_the_plans_query_as_the_caller():
     result = retrieve(make_state(), make_config(**SARA_HR), retriever=retriever)
 
     assert len(retriever.calls) == 1
-    assert retriever.calls[0]["query"] == "Maya Cohen offer letter"
+    # The user's own words first, then the planner's query (search_text).
+    assert retriever.calls[0]["query"] == f"{USER_MESSAGE} Maya Cohen offer letter"
     # Sara manages someone, so the code that builds the caller marks her a manager.
     assert retriever.calls[0]["caller"] == CallerContext(**SARA_HR, is_manager=True)
     assert [chunk["chunk_id"] for chunk in result["evidence"]] == [
@@ -170,3 +171,20 @@ def test_extra_search_adds_no_duplicates():
     assert [c["chunk_id"] for c in result["evidence"]] == [
         OFFER_LETTER.chunk_id, ONBOARDING_POLICY.chunk_id,
     ]
+
+
+def test_the_users_words_survive_the_planners_rewrite():
+    # "promoted" was dropped by the planner's query; the search must still see it.
+    plan = build_context_plan(TurnPlan(current_intent="policy_question", needs_documents=True,
+                                       needs_records=False, search_query="career path for CSM"),
+                              employee_ids={})
+    query = search_text(plan, "How do I get promoted here?")
+    assert query == "How do I get promoted here? career path for CSM"
+
+
+def test_a_long_message_is_cut_in_the_search():
+    plan = build_context_plan(TurnPlan(current_intent="other", needs_documents=True,
+                                       needs_records=False, search_query="Webex seats"),
+                              employee_ids={})
+    query = search_text(plan, "x" * 5000)
+    assert query == "x" * USER_WORDS_IN_SEARCH + " Webex seats"

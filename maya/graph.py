@@ -57,6 +57,7 @@ from maya.planning import (
     fallback_plan,
     respond_messages,
     message_text,
+    pasted_message_id,
     recent_turns,
 )
 from maya.ports import WebexPort
@@ -373,13 +374,39 @@ def merge_evidence(first: list[Evidence], extra: list[Evidence]) -> list[Evidenc
     return first + [chunk for chunk in extra if chunk.chunk_id not in seen]
 
 
+# How many chunks Maya's main search keeps after reranking. Six, not the retriever's
+# default four: long handbook pages split into many similar sections, and with four
+# the section holding the answer (e.g. "Promotion Process") often missed the cut.
+# Webex keeps the default.
+SEARCH_RESULTS = 6
+
+
+# The user's words in the search text are cut to this many characters, so a long
+# message (a pasted thread) can't drown out the planner's query.
+USER_WORDS_IN_SEARCH = 500
+
+
+def search_text(plan: ContextPlan, user_message: str) -> str:
+    """What the search looks for: the user's own words, then the planner's query.
+
+    The planner's query resolves names and pronouns ("her" -> "Maya Cohen"), but it
+    can also drop the user's key words: "How do I get promoted here? What does the
+    path look like for a CSM?" became "career path for CSM", which found job-title
+    pages instead of the "Promotion Process" section. With both, neither can lose
+    the other's words. Still one search.
+    """
+
+    words = " ".join(user_message.split())[:USER_WORDS_IN_SEARCH]
+    return f"{words} {plan.search_query}" if plan.search_query else words
+
+
 def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetriever) -> dict:
     """Step 5: search the documents for this turn. No model call of its own.
 
     - Unknown caller: no evidence ("fail closed": no search beats a search as nobody).
     - The plan needs no documents: no search.
-    - Otherwise: one search with the plan's search_query (or the user's message, if
-      the planner left it empty).
+    - Otherwise: one search for the user's words plus the plan's search_query
+      (search_text), keeping SEARCH_RESULTS chunks.
     - If the results lack a collection the topic needs (required_evidence), one more
       search, limited to the missing collections. Never a third, even if that one
       finds nothing. A topic with no required collections ("other") never needs one.
@@ -393,8 +420,8 @@ def retrieve(state: AgentState, config: RunnableConfig, retriever: EvidenceRetri
     if caller is None or not plan.needs_documents:
         return {"evidence": []}
 
-    query = plan.search_query or message_text(state["messages"][-1])
-    evidence = retriever.search(query, caller)
+    query = search_text(plan, message_text(state["messages"][-1]))
+    evidence = retriever.search(query, caller, k=SEARCH_RESULTS)
 
     missing = missing_collections(plan.required_evidence, evidence)
     if missing:
@@ -412,13 +439,31 @@ def select(state: AgentState) -> dict:
     return {"loadout": select_tools(ContextPlan(**state["plan"])), "rearmed": False}
 
 
-def model_with_tools(base_model, tools_by_name: dict, names: list[str]):
-    """Return the model with exactly these tools attached (no names: no tools)."""
+def model_with_tools(base_model, tools_by_name: dict, names: list[str],
+                     must_call_tool: bool = False):
+    """Return the model with exactly these tools attached (no names: no tools).
+
+    must_call_tool: the model may not answer in text this call; it has to call one of
+    the tools (Bedrock's tool_choice "any").
+    """
 
     if not names:
         return base_model
     chosen_tools = [tools_by_name[name] for name in sorted(names)]
+    if must_call_tool:
+        return base_model.bind_tools(chosen_tools, tool_choice="any")
     return base_model.bind_tools(chosen_tools)
+
+
+def must_call_tool(state: AgentState) -> bool:
+    """True on the retry after a missed lookup (rearm), until a tool has run.
+
+    The first try may answer without a tool; rearm deletes that answer. The retry then
+    has to call a tool, so the answer rests on the records, not on general documents
+    or an earlier message. Once a tool has run, the model is free to answer.
+    """
+
+    return state["rearmed"] and not used_tool_this_turn(state["messages"])
 
 
 def call_model(state: AgentState, base_model, tools_by_name: dict) -> dict:
@@ -428,7 +473,8 @@ def call_model(state: AgentState, base_model, tools_by_name: dict) -> dict:
     Returns the model's reply, which may be an answer or a request to call tools.
     """
 
-    model = model_with_tools(base_model, tools_by_name, state["loadout"])
+    model = model_with_tools(base_model, tools_by_name, state["loadout"],
+                             must_call_tool=must_call_tool(state))
     plan = ContextPlan(**state["plan"])  # the state stores the plan as a plain dict
     response = model.invoke(answer_messages(state, plan))
     return {"messages": [response]}
@@ -511,8 +557,10 @@ def respond(state: AgentState, responder) -> dict:
     plan = ContextPlan(**state["plan"])
     current_turn = recent_turns(state["messages"], keep=1)
     chunk_ids = [chunk["chunk_id"] for chunk in state.get("evidence") or []]
+    # A pasted email this turn is a source too, citable as e.g. user_message#2.
+    pasted = [pasted_id] if (pasted_id := pasted_message_id(state["messages"])) else []
     sources_seen = add_sources(state.get("sources_seen") or [],
-                               chunk_ids + tool_result_ids(current_turn))
+                               chunk_ids + tool_result_ids(current_turn) + pasted)
     # Code decides which turns get a checklist, not the model.
     checklist_wanted = plan.current_intent == "onboarding_status"
 
@@ -520,7 +568,8 @@ def respond(state: AgentState, responder) -> dict:
         result = responder.invoke(respond_messages(state, plan, checklist_wanted))
         # The answer the user reads is the answer model's, not a rewrite of it.
         raw = {**reply_args(result["raw"]), "answer": message_text(state["messages"][-1])}
-        reply = enforce_evidence(raw, sources_seen, checklist_wanted, plan.subject_employee_id)
+        reply = enforce_evidence(raw, sources_seen, checklist_wanted, plan.subject_employee_id,
+                                 saved_checklist=state.get("checklist"))
     except Exception:  # no reply, or one that still breaks a rule: never fail the turn
         reply = MayaReply(answer=message_text(state["messages"][-1]))
 
@@ -534,7 +583,10 @@ def respond(state: AgentState, responder) -> dict:
 
 # LangGraph counts every step it runs in a turn and stops the turn with an error past
 # this limit. It stops a model that keeps asking for tools from looping forever.
-RECURSION_LIMIT = 12
+# 16, not 12: a turn that takes the retry (rearm, then a forced tool call) runs about
+# 11 steps before its first extra tool round, and 12 crashed such a turn ("how do I
+# get my software licenses sorted?" calling a second tool).
+RECURSION_LIMIT = 16
 
 
 def build_graph(tools: list, retriever: EvidenceRetriever, webex: WebexPort):

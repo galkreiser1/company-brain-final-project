@@ -51,7 +51,7 @@ from maya.retrieval import OpenSearchRetriever
 import yaml
 
 from evals.maya_checks import (check_handoff, check_homework_rules, check_sources, check_turn,
-                               turn_handoffs)
+                               is_warning, turn_handoffs)
 from evals.tracing import RUN_STAMP, finish_turn, require_langfuse, traced_turn, turn_status
 from evals.webex_recording import RecordingWebexPort, real_webex_port
 
@@ -412,7 +412,17 @@ def describe_tool_call(call: dict) -> str:
 
 
 def describe_checks(checks: list) -> str:
-    return " · ".join(f"{label} {'✓' if passed else '✗'}" for label, passed in checks)
+    """Each check with ✓ (passed), ✗ (failed) or ⚠ (a warning: an illustrative field
+    the reference build did differently; see evals/maya_checks.py)."""
+
+    def mark(label: str, passed: bool) -> str:
+        return "⚠" if is_warning(label) else ("✓" if passed else "✗")
+
+    return " · ".join(f"{label} {mark(label, passed)}" for label, passed in checks)
+
+
+def count_warnings(records: list[dict]) -> int:
+    return sum(is_warning(check["label"]) for record in records for check in record["checks"])
 
 
 def was_rearmed(call: dict, calls: list) -> bool:
@@ -777,6 +787,7 @@ def save_run(runs: list[dict]) -> Path:
         "totals": {
             "turns": len(turns),
             "turns_passed": sum(all(c["passed"] for c in r["checks"]) for r in turns),
+            "warnings": count_warnings(turns),
             "model_calls": sum(r["model_calls"] for r in turns),
             "input_tokens": sum(r["input_tokens"] for r in turns),
         },
@@ -848,8 +859,9 @@ async def main(groups: list[str], turn_limit: int | None) -> int:
     turns = [record for run in runs for record in run["turns"]]
     passed = sum(all(c["passed"] for c in r["checks"]) for r in turns)
     input_tokens = sum(call["input_tokens"] for call in recorder.calls)
-    print(f"\nTOTAL  {passed}/{len(turns)} turns pass · {len(recorder.calls)} model calls · "
-          f"{input_tokens:,} input tokens")
+    print(f"\nTOTAL  {passed}/{len(turns)} turns pass · {count_warnings(turns)} warnings "
+          f"(illustrative fields only, see evals/maya_checks.py) · "
+          f"{len(recorder.calls)} model calls · {input_tokens:,} input tokens")
     print(f"Full log: {LOG_FILE.relative_to(REPO_ROOT)}")
     print(f"Run record: {save_run(runs).relative_to(REPO_ROOT)}")
     if failures:

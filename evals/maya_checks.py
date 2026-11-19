@@ -9,6 +9,31 @@ from maya.loadout import DOCUMENT_TOOLS, MAYA_READ_TOOLS
 from maya.ports import FakeWebexPort
 
 
+# BINDING OR ILLUSTRATIVE ------------------------------------------------------
+# GOLDEN-DATASETS.json (its _readme, "WHICH FIELDS BIND, AND WHICH WILL DRIFT") splits
+# its fields in two:
+#   - binding, a real defect if missed: required_facts, forbidden_facts,
+#     forbidden_tools, forbidden_sources, expected_sources, should_use_tools;
+#   - illustrative, how the course's reference build did it, expected to differ in a
+#     correct build: expected_intent, expected_tools, optional_tools, sequence,
+#     arg_checks.
+# A missed illustrative field is reported as a warning (it shows in the output and
+# the run record, but doesn't fail the turn). Every binding field, and every check of
+# our own, still fails the turn.
+
+WARNING = "warning: "
+
+
+def illustrative(label: str, matched: bool) -> tuple[str, bool]:
+    """A check on an illustrative field: passed as is, or a warning that doesn't fail."""
+
+    return (label, True) if matched else (WARNING + label, True)
+
+
+def is_warning(label: str) -> bool:
+    return label.startswith(WARNING)
+
+
 # THE TURN'S ANSWER, PLAN AND TOOLS -------------------------------------------
 
 def arg_check_passes(check: dict, tool_calls: list) -> bool:
@@ -36,7 +61,8 @@ def covered_by_evidence(evidence: list) -> bool:
 
 
 def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[tuple[str, bool]]:
-    """Grade one turn against the golden dataset. Returns (label, passed) pairs."""
+    """Grade one turn against the golden dataset. Returns (label, passed) pairs; a
+    missed illustrative field comes back as a passing "warning: ..." pair."""
 
     plan = result["plan"]
     called = {call["name"] for call in tool_calls}
@@ -48,7 +74,7 @@ def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[
     if turn.get("expected_intent"):
         accepted = turn["expected_intent"].split("|")
         label = f"intent {intent}" + ("" if intent in accepted else f" (expected {turn['expected_intent']})")
-        checks.append((label, intent in accepted))
+        checks.append(illustrative(label, intent in accepted))
 
     wants_tools = turn["should_use_tools"]
     plan_wants = plan["needs_documents"] or plan["needs_records"]
@@ -67,11 +93,11 @@ def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[
         if name not in called and not (by_evidence and name in DOCUMENT_TOOLS)
     ]
     label = f"expected tools (missing {', '.join(missing)})" if missing else "expected tools"
-    checks.append((label, not missing))
+    checks.append(illustrative(label, not missing))
 
     if turn.get("arg_checks"):
         passed = all(arg_check_passes(check, tool_calls) for check in turn["arg_checks"])
-        checks.append(("args", passed))
+        checks.append(illustrative("args", passed))
 
     # Each fact may list alternatives, "a|b": any one of them in the answer is enough.
     facts = turn.get("required_facts") or []

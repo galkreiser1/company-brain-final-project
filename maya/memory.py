@@ -156,6 +156,16 @@ PLANNER_PROMPT = (
       "The memory's topic is the session's history, not this turn.\n"
     + "- Checklists, seat counts, tickets and inventory in memory are a SNAPSHOT; if the "
       "user asks what the state is NOW, needs_records is True."
+    # Maya's own session, turn 2: a pasted email thread and "what here is mine to do?".
+    # The planner asked for records, so the retry forced a pointless get_employee call
+    # on a turn the golden data says needs no tools.
+    + "\n- If the user's NEWEST message itself contains a pasted email or thread and "
+      "asks about what it says (e.g. 'what here is mine to do?'), the answer is in the "
+      "pasted text: needs_records and needs_documents are False. This applies only to "
+      "the message carrying the paste: a later question (e.g. about licenses or a "
+      "laptop) is planned as usual, even if a pasted thread is earlier in the "
+      "conversation. Records are still needed for anything the pasted text doesn't "
+      "say, like the current state of a task or a seat."
 )
 
 

@@ -20,6 +20,8 @@ from maya.schemas import MayaReply
 
 # The reason given to a checklist item whose citations were all dropped.
 NO_EVIDENCE = "no supporting evidence found"
+# Added to the reason of a "blocked" item no record backs: it becomes unresolved.
+NOT_CONFIRMED = "not confirmed by a record"
 
 
 # 1. WHICH SOURCES ARE REAL ---------------------------------------------------
@@ -138,27 +140,67 @@ def merge_citations(first: list[dict], extra: list[dict]) -> list[dict]:
     return first + [c for c in extra if (c.get("chunk_id") or c.get("record_id")) not in seen]
 
 
-def checked_item(item: dict, sources_seen: set[str]) -> dict:
-    """The item with its fake citations dropped; unresolved if none are left."""
+def name_words(name: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", (name or "").lower()))
+
+
+def same_item(name: str, other: str) -> bool:
+    """True if two checklist item names are the same item, worded a little differently:
+    one's words all appear in the other's ("Equipment responsibility form" and "Sign
+    the equipment responsibility form")."""
+
+    words, other_words = name_words(name), name_words(other)
+    return bool(words and other_words) and (words <= other_words or other_words <= words)
+
+
+def earlier_citations(item: dict, saved_checklist: dict | None) -> list[dict]:
+    """The citations the same item had in the saved checklist (last checklist turn)."""
+
+    for saved in (saved_checklist or {}).get("items") or []:
+        if same_item(item.get("name", ""), saved.get("name", "")):
+            return saved.get("citations") or []
+    return []
+
+
+def checked_item(item: dict, sources_seen: set[str], saved_checklist: dict | None = None) -> dict:
+    """The item with its fake citations dropped; unresolved if none are left.
+
+    - An item that comes back with no real citation keeps the ones the same item had
+      in the saved checklist, if those are still real. (Maya's own session: the
+      equipment form, cited to the email pasted in turn 2, came back uncited in
+      turn 3 when the model rewrote the checklist, and was marked unresolved.)
+    - A blocked item with no record behind it becomes unresolved: a document can say
+      what someone needs, but only the live data shows it's blocked right now.
+    """
 
     citations = real_citations(item.get("citations"), sources_seen)
+    if not citations:
+        citations = real_citations(earlier_citations(item, saved_checklist), sources_seen)
     if not citations and item.get("status") != "unresolved":
         # Its claim (complete, blocked, ...) has nothing behind it.
         return {**item, "status": "unresolved", "reason": NO_EVIDENCE, "citations": []}
+    if item.get("status") == "blocked" and not any(c.get("record_id") for c in citations):
+        reason = f"{item['reason']}; {NOT_CONFIRMED}" if item.get("reason") else f"blocked, {NOT_CONFIRMED}"
+        item = {**item, "status": "unresolved", "reason": reason}
     if item.get("status") in ("blocked", "unresolved") and not item.get("reason"):
         item = {**item, "reason": NO_EVIDENCE}  # these must say why; we can't invent it
     return {**item, "citations": citations}
 
 
 def enforce_evidence(raw: dict, sources_seen: list[str], checklist_wanted: bool,
-                     subject_employee_id: str | None) -> MayaReply:
+                     subject_employee_id: str | None,
+                     saved_checklist: dict | None = None) -> MayaReply:
     """The model's raw reply, keeping only citations code can back up, as a MayaReply.
 
     Gets: the responder's raw reply (a dict), every ID seen so far, whether this turn
     wants a checklist (code decides that from the topic, not the model), and the
-    turn's subject (the checklist's employee_id: code knows it, the model may not).
+    turn's subject (the checklist's employee_id: code knows it, the model may not),
+    and the checklist saved by an earlier turn, if any.
     Returns: a MayaReply where
       - citations not in sources_seen are dropped, from the answer and every item;
+      - an item left with none keeps the same item's citations from the saved
+        checklist, if they are real;
+      - a blocked item no record backs becomes unresolved ("not confirmed by a record");
       - the answer's own [chunk_id]s are added to its citations;
       - an item left with no citation becomes unresolved, with reason "no supporting
         evidence found" (an item that was already unresolved keeps its reason);
@@ -172,7 +214,7 @@ def enforce_evidence(raw: dict, sources_seen: list[str], checklist_wanted: bool,
     if not checklist_wanted or not isinstance(checklist, dict):
         checklist = None
     else:
-        items = [checked_item(item, seen) for item in checklist.get("items") or []]
+        items = [checked_item(item, seen, saved_checklist) for item in checklist.get("items") or []]
         employee_id = subject_employee_id or checklist.get("employee_id")
         checklist = {**checklist, "employee_id": employee_id, "items": items}
 

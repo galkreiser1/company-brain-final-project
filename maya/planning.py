@@ -35,6 +35,18 @@ IMPORTANT_POINTERS = (
     # looked up and passed her name where a tool needs her id (which finds nothing).
     "- An employee id (like E001) is not the person's name. If a tool needs an "
     "employee_id you don't have, look it up with get_employee first."
+    # Asked what "the manager's guide" says, a regular employee got an answer that began
+    # "The manager guide says ..." while it rested on a handbook page: the guide is
+    # filtered out of their search, but the wording claimed it had been read.
+    "\n- Say which document an answer comes from by its own title. If the user asks "
+    "about a document that isn't in DOCUMENTS FOR THIS TURN (for example the "
+    "manager's guide), say you don't have access to it; never write as if you had "
+    "read it. You may then offer what the documents you do have say."
+    # Maya's own session, turn 2: asked what in a pasted thread was hers to do, the
+    # answer also went through other people's items (the Datadog renewal owner).
+    "\n- When the user asks what in a pasted email or thread is theirs to do, list "
+    "only their own items. Don't name or summarise other people's items; at most say "
+    "that the rest sits with others."
 )
 
 
@@ -512,8 +524,43 @@ RESPOND_PROMPT = (
     "source (about this person or system) wins over a general policy. If it is still "
     "not clear, mark the item unresolved and cite both sources.\n"
     "- Never say that access was granted.\n"
+    "- If the user pasted an email or a thread (shown under PASTED BY THE USER), a "
+    "claim taken from what the pasted text itself says may cite it: source = "
+    "user_message, chunk_id = the id shown there. Never cite it for a status or a "
+    "fact that the records or documents should show.\n"
     "- Fill the checklist only if CHECKLIST WANTED says yes; otherwise leave it empty."
 )
+
+
+# PASTED MATERIAL ---------------------------------------------------------------
+# A user may paste an email thread and ask what in it is theirs to do. Claims taken
+# from that thread have no document or record behind them: the paste itself is the
+# source. Only such a message gets an ID the respond step may cite; an ordinary
+# question does not, so it can never be used to back up a claim.
+
+# A forwarded-message marker, an email header line, or a quoted reply line.
+PASTED_MARKERS = re.compile(
+    r"^\s*(-{3,}.*(forwarded|original) message|from:\s|>)", re.IGNORECASE | re.MULTILINE)
+
+
+def has_pasted_material(text: str) -> bool:
+    """True if the message carries a pasted email or quoted thread."""
+
+    return bool(PASTED_MARKERS.search(text))
+
+
+def pasted_message_id(messages: list) -> str | None:
+    """The citable ID of this turn's user message, if it carries pasted material.
+
+    Like "user_message#3" for the third user message of the conversation: one ID per
+    turn, so a later turn can't reuse an earlier paste's ID by accident. None for an
+    ordinary message.
+    """
+
+    users = [message for message in messages if isinstance(message, HumanMessage)]
+    if not users or not has_pasted_material(message_text(users[-1])):
+        return None
+    return f"user_message#{len(users)}"
 
 
 def render_tool_results(messages: list) -> str:
@@ -538,13 +585,16 @@ def respond_messages(state: dict, plan: TurnPlan, checklist_wanted: bool) -> lis
 
     current_turn = recent_turns(state["messages"], keep=1)
     saved = state.get("checklist")
+    pasted_id = pasted_message_id(state["messages"])
+    pasted = (f"\n\n--- PASTED BY THE USER [{pasted_id}] ---\n{message_text(current_turn[0])}"
+              if pasted_id else "")
     content = (
         f"CHECKLIST WANTED: {'yes' if checklist_wanted else 'no'}\n\n"
         f"Established facts:\n{_bullets(plan.relevant_facts)}\n"
         f"Constraints still in force:\n{_bullets(plan.relevant_constraints)}\n\n"
         f"--- ANSWER TO STRUCTURE ---\n{message_text(state['messages'][-1])}\n\n"
         f"--- TOOL RESULTS THIS TURN ---\n{render_tool_results(current_turn)}"
-        f"{render_evidence(state.get('evidence') or [])}\n\n"
+        f"{render_evidence(state.get('evidence') or [])}{pasted}\n\n"
         f"--- SAVED CHECKLIST ---\n{json.dumps(saved, indent=1) if saved else '(none)'}"
     )
     return [SystemMessage(RESPOND_PROMPT), HumanMessage(content)]
