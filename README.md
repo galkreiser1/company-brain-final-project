@@ -148,8 +148,8 @@ python -m server.server                # serves the tools at http://127.0.0.1:98
 Then, in another terminal:
 
 ```
-python -m evals.run_maya_s2            # all 12 S2 turns (M-S-01 has the same messages)
-python -m evals.run_maya_s2 --turns 3  # a quick run
+python -m evals.run_maya               # every Maya item: 3 quick questions, both sessions (20 turns)
+python -m evals.run_maya --only onboarding --turns 3   # one group (quick, own, onboarding), a quick run
 python -m evals.run_webex              # W-I-01..03, W-S-01's 4 turns, W-I-03 again
 python -m webex.approve AP005 --as E018 --decision approved   # decide a waiting approval
 ```
@@ -165,7 +165,7 @@ python -m evals.build_dashboard        # add or update the scripted dashboard ch
 
 `-m` makes Python import from the project root, so `maya` is found.
 
-Each run writes `runs/maya_s2_<date-time>.json` (one record per turn: answer, checklist, source IDs, tool calls, handoffs, error, checks) and a full log, `runs/maya_s2.log`. A crashed turn is recorded and the run goes on. The exit code is 1 if any turn or the turn-10 replay failed. Each turn's summary shows its route (`maya`, `webex` or `handoff`) and the tools Webex called.
+`evals/run_maya.py` sends the five Maya items of `data/EVALUATION-INPUTS.yaml` through the agent: the three quick questions (M-I-01..03), Maya's own session (M-S-02, golden S9) and the onboarding session (M-S-01, golden S2, run last because its turn 10 files a Webex request, then replayed once). Each turn is checked in `evals/maya_checks.py` against its golden expectations; a check the golden data has no expectation for is skipped. The onboarding-only checks (the closed Rachel tangent, the turn-10 replay) run only on that session; where the golden data lists sources, a forbidden source (e.g. the manager playbook for a regular employee) must never be read. Each run writes `runs/maya_<date-time>.json` (one record per turn: answer, checklist, source IDs, tool calls, handoffs, error, checks, trace link) and a full log, `runs/maya.log`. A crashed turn is recorded and the run goes on. The exit code is 1 if any turn or the turn-10 replay failed. Each turn's summary shows its route (`maya`, `webex` or `handoff`) and the tools Webex called.
 
 `evals/run_webex.py` does the same for the Webex inputs (`data/EVALUATION-INPUTS.yaml`), checked in `evals/webex_checks.py`: who answered, the required facts, never "granted", and no rows added (counted before and after each message). It writes `runs/webex.log` and `runs/webex_<date-time>.json`.
 

@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import sys
 
-from evals.s2_checks import says_granted
+from evals.maya_checks import says_granted
 
 Result = tuple[float, str] | None
 

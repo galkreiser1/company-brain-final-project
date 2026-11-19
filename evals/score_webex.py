@@ -26,7 +26,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
 from evals.case_checks import DATA_TYPES, roll_up, score_turn
-from evals.run_maya_s2 import load_tools, one_line
+from evals.run_maya import load_tools, one_line
 from evals.tracing import RUN_STAMP, finish_turn, langfuse, require_langfuse, traced_turn, turn_status
 from evals.webex_recording import RecordingWebexPort, real_webex_port
 from maya.config import REPO_ROOT

@@ -1,18 +1,30 @@
-"""The S2 runner: replay golden session S2 on the Maya agent and check each turn.
+"""The Maya runner: send every Maya evaluation item through the agent and check each turn.
+
+The five Maya items of data/EVALUATION-INPUTS.yaml (20 turns, one trace each):
+  - three quick questions, each its own one-turn conversation:
+      personal laptop (M-I-01), MFA reset (M-I-02), Maya's equipment (M-I-03);
+  - Maya's own session (M-S-02, golden S9): 5 turns, Maya Cohen asking for herself;
+  - the onboarding session (M-S-01, golden S2): 12 turns, HR onboarding Maya Cohen.
+    Its turn 10 files a Webex request, so it runs last and is then replayed once
+    more: the replay must send nothing new.
+
+The messages and callers come from data/EVALUATION-INPUTS.yaml, the graded inputs.
+What each turn is expected to do comes from data/GOLDEN-DATASETS.json (ITEMS below
+pairs them); the checks live in evals/maya_checks.py.
 
 Needs this repo's MCP server running (python -m server.server). Webex questions and
 the turn 10 handoff go through the real Webex workflow (webex/), which reads and writes
 runs/novaops.db. Run from the repo root:
-    .venv/bin/python -m evals.run_maya_s2             # all 12 turns
-    .venv/bin/python -m evals.run_maya_s2 --turns 3   # a quick run
+    .venv/bin/python -m evals.run_maya                      # every item
+    .venv/bin/python -m evals.run_maya --only onboarding    # one group: quick, own, onboarding
+    .venv/bin/python -m evals.run_maya --only onboarding --turns 3   # a quick run
 
-All turns run on one thread_id, so they form one conversation. Two outputs:
+Each session's turns run on one thread_id, so they form one conversation. Outputs:
   - the terminal: a short summary per turn (tools called, checks, cost);
-  - runs/maya_s2.log: everything in full, including exactly what each model call
-    received. Rewritten on every run.
-
-The turns come from data/GOLDEN-DATASETS.json (search for "S2-onboarding-maya").
-The checks live in evals/s2_checks.py.
+  - runs/maya.log: everything in full, including exactly what each model call
+    received. Rewritten on every run;
+  - runs/maya_<YYYYmmdd-HHMMSS>.json: the run's record;
+  - one Langfuse trace per turn, tagged with the item's id.
 """
 
 import argparse
@@ -36,23 +48,35 @@ from maya.memory import DISTIL_PROMPT, PLANNER_PROMPT, estimate_tokens, render_m
 from maya.planning import ASSISTANT_PROMPT, IMPORTANT_POINTERS, message_text, render_transcript
 from maya.respond import tool_result_ids
 from maya.retrieval import OpenSearchRetriever
-from evals.s2_checks import check_handoff, check_homework_rules, check_turn, turn_handoffs
+import yaml
+
+from evals.maya_checks import (check_handoff, check_homework_rules, check_sources, check_turn,
+                               turn_handoffs)
 from evals.tracing import RUN_STAMP, finish_turn, require_langfuse, traced_turn, turn_status
 from evals.webex_recording import RecordingWebexPort, real_webex_port
 
 
+EVALUATION_INPUTS = REPO_ROOT / "data" / "EVALUATION-INPUTS.yaml"
 GOLDEN_DATASETS = REPO_ROOT / "data" / "GOLDEN-DATASETS.json"
-LOG_FILE = REPO_ROOT / "runs" / "maya_s2.log"
+LOG_FILE = REPO_ROOT / "runs" / "maya.log"
 RUNS_DIR = REPO_ROOT / "runs"  # not committed: the records hold employee data
-SESSION_ID = "S2-onboarding-maya"
-TURNS_TO_RUN = 12  # the default: the whole session; --turns changes it
-MAX_TURNS = 12   # S2 has 12 turns
-HANDOFF_TURN = 10  # the turn that files the Webex request; replayed at the end
+ONBOARDING = "M-S-01"  # the onboarding session: the only one with a tangent and a handoff
+HANDOFF_TURN = 10  # its turn that files the Webex request; replayed at the end
 
-# The conversation's ID. The checkpointer saves the state under it, so every turn sent
-# with the same thread_id continues the same conversation. It's the session's id, so a
-# saved run can be matched to its golden session.
-THREAD_ID = SESSION_ID
+# Each Maya item: its id in EVALUATION-INPUTS.yaml, the golden entry with its
+# expectations, a plain name, and the --only group it belongs to. In run order: the
+# onboarding session writes to the database (turn 10), so it goes last.
+ITEMS = [
+    ("M-I-01", "SIMPLE_001", "quick question: personal laptop", "quick"),
+    ("M-I-02", "SIMPLE_002", "quick question: MFA reset", "quick"),
+    ("M-I-03", "SIMPLE_007", "quick question: Maya's equipment", "quick"),
+    ("M-S-02", "S9-maya-own-account", "Maya's own session", "own"),
+    (ONBOARDING, "S2-onboarding-maya", "onboarding session", "onboarding"),
+]
+GROUPS = ("quick", "own", "onboarding")
+
+# The evaluation file names groups; the agent's config uses their IDs.
+GROUP_IDS = {"Regular Employee": "UG_REGULAR", "HR Group": "UG_HR", "IT Group": "UG_IT"}
 
 # Long prompts that calls repeat. The log shows ‹NAME› instead of the full text, so
 # what changes from call to call stands out.
@@ -86,11 +110,54 @@ async def load_tools() -> list:
     return await client.get_tools()
 
 
-def load_session() -> dict:
-    """Session S2: who is asking (caller_id, caller_group), and its turns."""
+def same_text(a: str, b: str) -> bool:
+    return " ".join(a.split()) == " ".join(b.split())
 
-    sessions = json.loads(GOLDEN_DATASETS.read_text())["sessions"]
-    return next(s for s in sessions if s["id"] == SESSION_ID)
+
+def quick_question_turn(case: dict) -> dict:
+    """A golden single-turn case in the shape of a session turn, so the same checks run.
+
+    should_use_tools is True for all three: each needs documents (its expected_sources),
+    and the retrieve step's search counts as a lookup. (The case's requires_tool_call
+    means a database tool, which only Maya's equipment question needs.)
+    """
+
+    return {"n": 1, "user": case["input"], "should_use_tools": True,
+            "expected_sources": case["expected_sources"]}
+
+
+def load_items(groups: list[str]) -> list[dict]:
+    """The Maya items to run: caller and messages from EVALUATION-INPUTS.yaml, each turn's
+    expectations from GOLDEN-DATASETS.json. Stops if the two files' messages differ."""
+
+    workflows = yaml.safe_load(EVALUATION_INPUTS.read_text())["workflows"]
+    maya = next(w for w in workflows if w["id"] == "maya")
+    inputs = {item["id"]: item for item in maya["inputs"] + maya["sessions"]}
+    golden = json.loads(GOLDEN_DATASETS.read_text())
+    expectations = {s["id"]: s["turns"] for s in golden["sessions"]}
+    expectations |= {c["case_id"]: [quick_question_turn(c)] for c in golden["single_turn_cases"]}
+
+    items = []
+    for item_id, golden_id, plain, group in ITEMS:
+        if group not in groups:
+            continue
+        given = inputs[item_id]
+        messages = [t["message"] for t in given["turns"]] if "turns" in given else [given["message"]]
+        turns = expectations[golden_id]
+        if len(turns) != len(messages) or not all(
+                same_text(t["user"], m) for t, m in zip(turns, messages)):
+            raise SystemExit(f"{item_id}: its messages differ from golden {golden_id}")
+        caller = given["caller"]
+        items.append({
+            "id": item_id, "plain": plain, "group": group, "turns": turns,
+            "session": "turns" in given,
+            # The conversation's ID. The checkpointer saves the state under it, so every
+            # turn sent with the same thread_id continues the same conversation.
+            "thread_id": golden_id,
+            "caller_id": caller["employee_id"],
+            "caller_group": GROUP_IDS[caller["group"]],
+        })
+    return items
 
 
 # RECORDING EVERY MODEL CALL --------------------------------------------------
@@ -184,7 +251,7 @@ def describe_handoffs(handoffs: list[dict]) -> str:
 
 
 async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
-                   retriever: RecordingRetriever, webex: RecordingWebexPort) -> dict:
+                   retriever: RecordingRetriever, webex: RecordingWebexPort, item: dict) -> dict:
     """Send one user message, then collect what happened in that turn."""
 
     first_call = len(recorder.calls)
@@ -213,12 +280,12 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
     webex_tool_calls = webex.tool_calls[first_webex_tool:]
     checked_calls = tool_calls + (webex_tool_calls if asked_webex else [])
     evidence = result.get("evidence") or []
+    source_ids = [chunk["chunk_id"] for chunk in evidence] + tool_result_ids(messages[turn_start:])
     return {
         "turn": turn,
         "answer": answer,
         # What this turn looked at: the chunks it retrieved, the records its tools returned.
-        "source_ids": ([chunk["chunk_id"] for chunk in evidence]
-                       + tool_result_ids(messages[turn_start:])),
+        "source_ids": source_ids,
         "plan": result["plan"],
         "denied": answer == REFUSAL,  # the authorize step sent the turn down the deny path
         "route": turn_route(answer == REFUSAL, asked_webex, handoffs),
@@ -227,7 +294,9 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
         "webex_tool_calls": webex_tool_calls,
         "handoffs": handoffs,
         "checks": (check_turn(turn, result, checked_calls, answer) + check_handoff(turn, handoffs)
-                   + check_homework_rules(turn, result, checked_calls, answer)
+                   + check_sources(turn, source_ids)
+                   + check_homework_rules(turn, result, checked_calls, answer,
+                                          tangent=item["id"] == ONBOARDING)
                    + [("finished without error", True)]),
         "error": None,
         "model_calls": recorder.calls[first_call:],
@@ -243,29 +312,52 @@ async def run_turn(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
     }
 
 
+def trace_name(item: dict, number: int, suffix: str = "") -> str:
+    """Like "M-S-02 turn 3 · Maya's own session", or "M-I-01 · quick question: ..."."""
+
+    turn = f" turn {number}{suffix}" if item["session"] else suffix
+    return f"{item['id']}{turn} · {item['plain']}"
+
+
+def trace_tags(item: dict) -> list[str]:
+    # The onboarding session keeps the S2 runner's old tags, so its earlier traces
+    # and the new ones are found by the same filter.
+    old = ["s2-runner", "S2"] if item["id"] == ONBOARDING else []
+    return ["maya-runner", item["id"], item["group"]] + old
+
+
 async def run_traced_turn(graph, config: dict, recorder: ModelCallRecorder, number: int,
                           turn: dict, retriever: RecordingRetriever, webex: RecordingWebexPort,
-                          caller_id: str) -> dict:
-    """run_turn_safely inside its own Langfuse trace, labelled "S2 turn N"."""
+                          item: dict) -> dict:
+    """run_turn_safely inside its own Langfuse trace, named after the item and turn."""
 
     first_result = len(webex.results)
     with traced_turn(
-        f"S2 turn {number}", turn["user"], conversation=SESSION_ID, user_id=caller_id,
-        tags=["s2-runner", "S2"], metadata={"case_id": "S2", "turn": str(number)},
+        trace_name(item, number), turn["user"], conversation=item["thread_id"],
+        user_id=item["caller_id"], tags=trace_tags(item),
+        metadata={"case_id": item["id"], "turn": str(number), "caller_group": item["caller_group"]},
     ) as root:
-        outcome = await run_turn_safely(graph, config, recorder, turn, retriever, webex)
+        outcome = await run_turn_safely(graph, config, recorder, turn, retriever, webex, item)
         refused = outcome["answer"] == REFUSAL
+        results = webex.results[first_result:]
         outcome["trace_url"] = finish_turn(root, outcome["answer"], {
-            "status": "error" if outcome["error"] else turn_status(refused, webex.results[first_result:]),
+            "status": "error" if outcome["error"] else turn_status(refused, results),
+            "caller_group": item["caller_group"],
             "route": outcome["route"],
             "intent": (outcome.get("plan") or {}).get("current_intent"),
+            # The scope: the tools this turn could use, then the ones it called.
+            "loadout": outcome.get("loadout") or [],
+            "tool_sequence": [call["name"] for call in outcome["tool_calls"]
+                              + outcome["webex_tool_calls"]],
+            "request_ids": [result.request_id for result in results if result.request_id],
             "passed": turn_passed(outcome),
         })
     return outcome
 
 
 async def run_turn_safely(graph, config: dict, recorder: ModelCallRecorder, turn: dict,
-                          retriever: RecordingRetriever, webex: RecordingWebexPort) -> dict:
+                          retriever: RecordingRetriever, webex: RecordingWebexPort,
+                          item: dict) -> dict:
     """run_turn, but a crash becomes a failed turn instead of ending the run.
 
     A crash on turn 6 (say, GraphRecursionError) must not hide turns 7-12. The next
@@ -274,7 +366,7 @@ async def run_turn_safely(graph, config: dict, recorder: ModelCallRecorder, turn
 
     first_call = len(recorder.calls)
     try:
-        return await run_turn(graph, config, recorder, turn, retriever, webex)
+        return await run_turn(graph, config, recorder, turn, retriever, webex, item)
     except Exception as error:
         return {
             "turn": turn,
@@ -566,10 +658,10 @@ How to read this log:
 """
 
 
-def log_header(tool_count: int) -> str:
+def log_header(tool_count: int, items: list[dict]) -> str:
     started = datetime.now().strftime("%Y-%m-%d %H:%M")
     return (
-        f"S2 runner log · {started} · session {SESSION_ID} · thread {THREAD_ID}\n"
+        f"Maya runner log · {started} · {', '.join(item['id'] for item in items)}\n"
         f"{tool_count} tools from {MCP_SERVER_URL}\n\n"
         + LOG_INTRO.format(short=SHORT)
     )
@@ -586,7 +678,7 @@ def describe_tools_shown(names: list[str], tool_count: int) -> str:
     return ", ".join(names) or "none"
 
 
-def log_turn(number: int, outcome: dict, tool_count: int) -> str:
+def log_turn(number: int, outcome: dict, tool_count: int, thread_id: str) -> str:
     """Everything that happened in one turn, for the log file."""
 
     rule = "═" * 78
@@ -626,7 +718,7 @@ def log_turn(number: int, outcome: dict, tool_count: int) -> str:
         f"{describe_evidence(outcome['evidence'], outcome['reply'])}",
         f"CITES    {describe_citations(outcome['reply'])}",
         "CHECKLIST " + "\n  ".join(describe_checklist(outcome["reply"])),
-        f"STATE    {outcome['saved_messages']} messages saved in thread {THREAD_ID}",
+        f"STATE    {outcome['saved_messages']} messages saved in thread {thread_id}",
         f"HANDOFF  {describe_handoffs(outcome['handoffs'])}",
         f"MEMORY   {describe_memory(outcome)}",
     ]
@@ -663,56 +755,54 @@ def turn_record(number: int, outcome: dict) -> dict:
     }
 
 
-def failure_lines(records: list[dict], replay_passed: bool | None) -> list[str]:
+def failure_lines(item_id: str, records: list[dict]) -> list[str]:
     """One line per failed turn, naming its failed checks, e.g.
-    "turn 6: expected tools (missing get_policy)". Plus the replay, if it failed."""
+    "M-S-01 turn 6: expected tools (missing get_policy)"."""
 
     lines = []
     for record in records:
         failed = [check["label"] for check in record["checks"] if not check["passed"]]
         if failed:
-            lines.append(f"turn {record['turn']}: {'; '.join(failed)}")
-    if replay_passed is False:
-        lines.append(f"replay turn {HANDOFF_TURN}: sent a second handoff, or didn't say pending")
+            lines.append(f"{item_id} turn {record['turn']}: {'; '.join(failed)}")
     return lines
 
 
-def save_run(records: list[dict], replay_passed: bool | None) -> Path:
-    """Write the whole run to runs/maya_s2_<YYYYmmdd-HHMMSS>.json. Returns its path."""
+def save_run(runs: list[dict]) -> Path:
+    """Write the whole run to runs/maya_<YYYYmmdd-HHMMSS>.json. Returns its path."""
 
-    path = RUNS_DIR / f"maya_s2_{datetime.now():%Y%m%d-%H%M%S}.json"
-    run = {
-        "session": SESSION_ID,
-        "thread_id": THREAD_ID,
-        "turns": records,
-        "replay_turn_10_passed": replay_passed,  # None: the run didn't reach turn 10
+    path = RUNS_DIR / f"maya_{datetime.now():%Y%m%d-%H%M%S}.json"
+    turns = [record for run in runs for record in run["turns"]]
+    record = {
+        "items": runs,
         "totals": {
-            "turns": len(records),
-            "turns_passed": sum(all(c["passed"] for c in r["checks"]) for r in records),
-            "model_calls": sum(r["model_calls"] for r in records),
-            "input_tokens": sum(r["input_tokens"] for r in records),
+            "turns": len(turns),
+            "turns_passed": sum(all(c["passed"] for c in r["checks"]) for r in turns),
+            "model_calls": sum(r["model_calls"] for r in turns),
+            "input_tokens": sum(r["input_tokens"] for r in turns),
         },
     }
-    path.write_text(json.dumps(run, indent=2, default=str))  # default=str: e.g. a date
+    path.write_text(json.dumps(record, indent=2, default=str))  # default=str: e.g. a date
     return path
 
 
 # MAIN ------------------------------------------------------------------------
 
-def turns_to_run() -> int:
-    """How many S2 turns to run: --turns N (1-12), or TURNS_TO_RUN."""
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the Maya evaluation items.")
+    parser.add_argument("--only", choices=GROUPS, action="append",
+                        help="run only this group (repeatable): quick, own, onboarding")
+    parser.add_argument("--turns", type=int, metavar="N",
+                        help="run only each session's first N turns (a quick run)")
+    return parser.parse_args()
 
-    parser = argparse.ArgumentParser(description="Run the first N turns of session S2.")
-    parser.add_argument("--turns", type=int, default=TURNS_TO_RUN,
-                        choices=range(1, MAX_TURNS + 1), metavar=f"1-{MAX_TURNS}")
-    return parser.parse_args().turns
 
-
-async def replay_handoff_turn(graph, config: dict, turn: dict, webex: RecordingWebexPort) -> bool:
+async def replay_handoff_turn(graph, config: dict, turn: dict, webex: RecordingWebexPort,
+                              handoffs_before: int) -> bool:
     """Send the handoff turn's message once more, on the same thread. Returns passed.
 
     The checkpointer already holds the first send's key, so nothing new may reach the
-    workflow: the port must still hold exactly one call, and the reply says pending.
+    workflow: this session must still have sent exactly one handoff, and the reply says
+    pending.
     """
 
     try:
@@ -721,88 +811,104 @@ async def replay_handoff_turn(graph, config: dict, turn: dict, webex: RecordingW
         print(f"replay turn {HANDOFF_TURN}: FAIL · {type(error).__name__}: {error}")
         return False
     answer = (result.get("reply") or {}).get("answer", "")
-    passed = len(webex.calls) == 1 and "pending" in answer.lower()
-    print(f"replay turn {HANDOFF_TURN}: {len(webex.calls)} handoff call(s) in total · "
+    sent = len(webex.calls) - handoffs_before
+    passed = sent == 1 and "pending" in answer.lower()
+    print(f"replay turn {HANDOFF_TURN}: {sent} handoff call(s) in this session · "
           f"{'PASS' if passed else 'FAIL'} · {one_line(answer, 90, count_dropped=False)}")
     return passed
 
 
-async def main(turn_count: int) -> int:
-    """Run the turns, save the record, and return the exit code: 1 if anything failed."""
+async def main(groups: list[str], turn_limit: int | None) -> int:
+    """Run the items, save the record, and return the exit code: 1 if anything failed."""
 
     require_langfuse()
     tools = await load_tools()
     retriever = RecordingRetriever(OpenSearchRetriever())
+    items = load_items(groups)
     # The real Webex workflow, recorded. Its own searches use the plain retriever, so
     # `retriever.searches` stays Maya's only.
     async with real_webex_port(tools, OpenSearchRetriever()) as webex:
-        return await run_session(tools, retriever, webex, turn_count)
+        graph = build_graph(tools, retriever, webex)
+        recorder = ModelCallRecorder()
+        print(f"Maya runner: {len(items)} items · {len(tools)} tools from MCP, Maya loads "
+              f"{TOOL_COUNT} · Langfuse run {RUN_STAMP}")
+        LOG_FILE.parent.mkdir(exist_ok=True)
+        runs, failures = [], []
+        with LOG_FILE.open("w") as log:
+            log.write(log_header(len(tools), items))
+            for item in items:
+                run = await run_item(graph, recorder, item, retriever, webex, log, turn_limit,
+                                     len(tools))
+                runs.append(run)
+                failures += failure_lines(item["id"], run["turns"])
+                if run.get("replay_passed") is False:
+                    failures.append(f"{item['id']} replay turn {HANDOFF_TURN}: "
+                                    "sent a second handoff, or didn't say pending")
 
-
-async def run_session(tools: list, retriever: RecordingRetriever, webex: RecordingWebexPort,
-                      turn_count: int) -> int:
-    """main()'s body, run while the Webex workflow's saved runs are open."""
-
-    graph = build_graph(tools, retriever, webex)
-    recorder = ModelCallRecorder()
-    session = load_session()
-    config = {
-        # The caller is set here, by code: the retrieve step searches as this person.
-        "configurable": {
-            "thread_id": THREAD_ID,
-            "caller_id": session["caller_id"],
-            "user_group": session["caller_group"],
-        },
-        "callbacks": [recorder],
-    }
-    turns = session["turns"][:turn_count]
-    print(f"S2 runner: {SESSION_ID}, turns 1-{len(turns)} · {len(tools)} tools from MCP, Maya loads {TOOL_COUNT} · "
-          f"caller {session['caller_id']} ({session['caller_group']}) · Langfuse run {RUN_STAMP}")
-
-    LOG_FILE.parent.mkdir(exist_ok=True)
-    passed = 0
-    records = []
-    with LOG_FILE.open("w") as log:
-        log.write(log_header(len(tools)))
-        for number, turn in enumerate(turns, start=1):
-            outcome = await run_traced_turn(graph, config, recorder, number, turn, retriever,
-                                            webex, session["caller_id"])
-            if outcome["error"]:
-                print(describe_error_turn(number, outcome))
-                log.write("\n" + describe_error_turn(number, outcome) + "\n")
-            else:
-                print_turn(number, outcome)
-                log.write(log_turn(number, outcome, len(tools)))
-            print(f"  trace: {outcome['trace_url'] or '(none)'}")
-            log.write(f"TRACE {outcome['trace_url'] or '(none)'}\n")
-            passed += turn_passed(outcome)
-            records.append(turn_record(number, outcome))
-
+    turns = [record for run in runs for record in run["turns"]]
+    passed = sum(all(c["passed"] for c in r["checks"]) for r in turns)
     input_tokens = sum(call["input_tokens"] for call in recorder.calls)
     print(f"\nTOTAL  {passed}/{len(turns)} turns pass · {len(recorder.calls)} model calls · "
           f"{input_tokens:,} input tokens")
     print(f"Full log: {LOG_FILE.relative_to(REPO_ROOT)}")
-
-    replay_passed = None
-    if turn_count >= HANDOFF_TURN:
-        replay = turns[HANDOFF_TURN - 1]
-        with traced_turn(
-            f"S2 turn {HANDOFF_TURN} (again)", replay["user"], conversation=SESSION_ID,
-            user_id=session["caller_id"], tags=["s2-runner", "S2"],
-            metadata={"case_id": "S2", "turn": f"{HANDOFF_TURN}-replay"},
-        ) as root:
-            replay_passed = await replay_handoff_turn(graph, config, replay, webex)
-            print(f"  trace: {finish_turn(root, '', {'passed': replay_passed})}")
-
-    print(f"Run record: {save_run(records, replay_passed).relative_to(REPO_ROOT)}")
-    failures = failure_lines(records, replay_passed)
+    print(f"Run record: {save_run(runs).relative_to(REPO_ROOT)}")
     if failures:
         print("\nFAILED\n  " + "\n  ".join(failures))
     return 1 if failures else 0
 
 
+async def run_item(graph, recorder: ModelCallRecorder, item: dict, retriever: RecordingRetriever,
+                   webex: RecordingWebexPort, log, turn_limit: int | None,
+                   tool_count: int) -> dict:
+    """One item: its turns in order on one thread, then (onboarding only) the replay."""
+
+    config = {
+        # The caller is set here, by code: the retrieve step searches as this person.
+        "configurable": {
+            "thread_id": item["thread_id"],
+            "caller_id": item["caller_id"],
+            "user_group": item["caller_group"],
+        },
+        "callbacks": [recorder],
+    }
+    turns = item["turns"][:turn_limit] if item["session"] else item["turns"]
+    handoffs_before = len(webex.calls)
+    print(f"\n{'━' * 78}\n{item['id']} · {item['plain']} · {len(turns)} turn(s) · "
+          f"caller {item['caller_id']} ({item['caller_group']})")
+    log.write(f"\n{'█' * 78}\n{item['id']} · {item['plain']} · thread {item['thread_id']}\n")
+
+    records = []
+    for number, turn in enumerate(turns, start=1):
+        outcome = await run_traced_turn(graph, config, recorder, number, turn, retriever,
+                                        webex, item)
+        if outcome["error"]:
+            print(describe_error_turn(number, outcome))
+            log.write("\n" + describe_error_turn(number, outcome) + "\n")
+        else:
+            print_turn(number, outcome)
+            log.write(log_turn(number, outcome, tool_count, item["thread_id"]))
+        print(f"  trace: {outcome['trace_url'] or '(none)'}")
+        log.write(f"TRACE {outcome['trace_url'] or '(none)'}\n")
+        records.append(turn_record(number, outcome) | {"trace_url": outcome["trace_url"]})
+
+    run = {"id": item["id"], "plain": item["plain"], "thread_id": item["thread_id"],
+           "turns": records}
+    if item["id"] == ONBOARDING and len(turns) >= HANDOFF_TURN:
+        replay = turns[HANDOFF_TURN - 1]
+        with traced_turn(
+            trace_name(item, HANDOFF_TURN, " (again)"), replay["user"],
+            conversation=item["thread_id"], user_id=item["caller_id"], tags=trace_tags(item),
+            metadata={"case_id": item["id"], "turn": f"{HANDOFF_TURN}-replay"},
+        ) as root:
+            run["replay_passed"] = await replay_handoff_turn(graph, config, replay, webex,
+                                                             handoffs_before)
+            print(f"  trace: {finish_turn(root, '', {'passed': run['replay_passed']})}")
+    return run
+
+
 if __name__ == "__main__":
-    exit_code = asyncio.run(main(turns_to_run()))
+    args = parse_args()
+    exit_code = asyncio.run(main(args.only or list(GROUPS), args.turns))
     # Langfuse sends traces in batches from a background thread. Flush before exiting,
     # or the last ones are lost.
     get_client().flush()

@@ -28,7 +28,7 @@ import yaml
 from langchain_core.messages import HumanMessage
 from langfuse import get_client
 
-from evals.run_maya_s2 import describe_checks, describe_tool_call, load_tools, one_line, turn_route
+from evals.run_maya import describe_checks, describe_tool_call, load_tools, one_line, turn_route
 from evals.webex_checks import COUNTED_TABLES, EXPECTED, check_input
 from evals.tracing import RUN_STAMP, finish_turn, require_langfuse, traced_turn, turn_status
 from evals.webex_recording import RecordingWebexPort, real_webex_port

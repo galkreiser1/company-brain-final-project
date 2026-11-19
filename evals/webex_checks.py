@@ -5,7 +5,7 @@ The binding parts follow the spec: required facts in the answer, never "granted"
 and no duplicate writes (rows added are counted before and after each input).
 """
 
-from evals.s2_checks import says_granted
+from evals.maya_checks import says_granted
 
 # Webex's records, counted before and after each input.
 COUNTED_TABLES = ("tickets", "access_requests", "approvals")

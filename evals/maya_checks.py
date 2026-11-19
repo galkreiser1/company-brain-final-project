@@ -1,6 +1,8 @@
-"""The S2 checks: grade one turn's result against the golden dataset.
+"""The Maya checks: grade one turn's result against the golden dataset.
 
-Each check returns (label, passed) pairs. Used by evals/run_maya_s2.py.
+Each check returns (label, passed) pairs. Used by evals/run_maya.py, for every Maya
+item: the two sessions and the three quick questions. A check whose expectation the
+golden data doesn't give is skipped, not failed.
 """
 
 from maya.loadout import DOCUMENT_TOOLS, MAYA_READ_TOOLS
@@ -89,6 +91,32 @@ def check_turn(turn: dict, result: dict, tool_calls: list, answer: str) -> list[
     forbidden = [name for name in turn.get("forbidden_tools", []) if name in called]
     label = f"forbidden tool called: {', '.join(forbidden)}" if forbidden else "no forbidden tool"
     checks.append((label, not forbidden))
+    return checks
+
+
+# THE SOURCES THE TURN READ -------------------------------------------------
+
+def check_sources(turn: dict, source_ids: list[str]) -> list[tuple[str, bool]]:
+    """Which documents the turn read, when the golden data says.
+
+    - forbidden sources: none of them may be read at all. This is the manager-playbook
+      boundary: a regular employee's search must not return those chunks, even if
+      the answer would look right with them.
+    - expected sources: at least one of them read (a source is a file name, e.g.
+      "equipment_policy.md"; a chunk ID is "policies/equipment_policy.md#2").
+    """
+
+    checks = []
+    forbidden = turn.get("forbidden_sources") or []
+    read = [source for source in forbidden if any(source in sid for sid in source_ids)]
+    if forbidden:
+        checks.append(("no forbidden source" + (f" (read {', '.join(read)})" if read else ""),
+                       not read))
+    expected = turn.get("expected_sources") or []
+    if expected:
+        found = any(source in sid for source in expected for sid in source_ids)
+        checks.append(("an expected source read" + ("" if found else f" (none of {', '.join(expected)})"),
+                       found))
     return checks
 
 
@@ -209,11 +237,15 @@ def says_granted(answer: str) -> bool:
     return False
 
 
-def check_homework_rules(turn: dict, result: dict, tool_calls: list,
-                         answer: str) -> list[tuple[str, bool]]:
-    """The homework's per-turn rules: tangent closed, citations real, never "granted"."""
+def check_homework_rules(turn: dict, result: dict, tool_calls: list, answer: str,
+                         tangent: bool = True) -> list[tuple[str, bool]]:
+    """The homework's per-turn rules: tangent closed, citations real, never "granted".
+
+    The tangent (Rachel's ticket, closed after turn 5) exists only in the onboarding
+    session: other items pass tangent=False.
+    """
 
     checklist = (result.get("reply") or {}).get("checklist")
-    return (check_tangent(turn["n"], answer, checklist, tool_calls)
+    return ((check_tangent(turn["n"], answer, checklist, tool_calls) if tangent else [])
             + check_citations(checklist, result.get("sources_seen") or [])
             + [("never granted", not says_granted(answer))])
