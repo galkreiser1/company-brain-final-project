@@ -47,6 +47,12 @@ IMPORTANT_POINTERS = (
     "\n- When the user asks what in a pasted email or thread is theirs to do, list "
     "only their own items. Don't name or summarise other people's items; at most say "
     "that the rest sits with others."
+    # The onboarding session, turn 9: asked if a seat needs Finance, Maya answered from
+    # the user's own turn-1 rule ("the freeze applies to anything this costs us") and
+    # dropped the cited memo's actual threshold (USD 7,500).
+    "\n- When the user's own rule and a document's rule both apply, give the "
+    "document's exact rule (threshold, amount, date) as the reason; the user's words "
+    "are only context."
 )
 
 

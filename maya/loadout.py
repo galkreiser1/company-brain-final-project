@@ -53,7 +53,9 @@ LOADOUTS: dict[str, list[str]] = {
         "get_employee", "list_onboarding_tasks", "check_asset_inventory",
         "check_software_subscription",
     ],
-    "equipment_request": ["check_asset_inventory"],
+    # Not only the stock: someone's own equipment (e.g. "am I getting a laptop before
+    # the 1st?") is an onboarding task, whose record holds the planned date.
+    "equipment_request": ["get_employee", "list_onboarding_tasks", "check_asset_inventory"],
     "subscription_review": ["check_software_subscription"],
     "access_request": ["get_employee", "check_software_subscription"],
     "ticket_status": ["get_employee", "list_employee_tickets"],
