@@ -44,12 +44,25 @@ Model answers vary between runs, so a rerun gives slightly different numbers.
 
 A denied turn ends with a fixed refusal before any search, tool or model call. That is the only way to leak nothing, since the MCP tools don't check who is asking.
 
+## How Maya searches the documents
+
+The `retrieve` step searches once per turn, as the caller, through the filter above (`maya/graph.py`, `maya/retrieval.py`).
+
+- **What it searches for:** the user's own words plus the planner's rewritten query (`search_text`). The rewrite resolves names ("her" becomes "Maya Cohen") but can drop the user's key words: "How do I get promoted here?" became "career path for CSM" and found job-title pages instead of the "Promotion Process" section.
+- **Two stages, blended:** the vector search picks 20 candidates, and a Nova reranker scores them. The final order is half the reranker's score plus half a score from the candidate's place in the vector search (`blend`). The reranker alone ranked "Promotion Process" 13th of 20 although the vector search had it 1st. With the blend, it made the top 6 in 9 of 9 test searches, up from 6 of 9.
+- **How many:** Maya keeps 6 chunks (`SEARCH_RESULTS`); Webex keeps the default 4. Long handbook pages split into many similar sections, and with 4 the right one often missed the cut.
+- If a topic needs a collection the first search missed, one more search runs, limited to that collection.
+- Tests: `tests/test_maya_blend.py`, `tests/test_maya_retrieve_step.py`.
+
 ## Every turn returns a checked `MayaReply`
 
 The last step, `respond`, turns the answer into a `MayaReply`: the answer, its citations, and on onboarding turns a checklist (`maya/schemas.py`).
 
 - The model proposes citations; code keeps only those pointing at a chunk or record this conversation has actually seen (`maya/respond.py`).
-- A checklist item left with no real citation becomes `unresolved`.
+- A checklist item left with no real citation becomes `unresolved`. If the model drops an item's citation when it rewrites the checklist on a later turn, the item keeps the citation it had last turn, if still real (`checked_item`).
+- **"Blocked" needs a record.** A document can say what someone needs, but only the live data shows it's blocked now. A `blocked` item with no database record behind it becomes `unresolved`, with the reason "…; not confirmed by a record".
+- **A pasted email is a source.** When the user pastes an email or a quoted thread, that message can be cited as `user_message#N`, on that turn only (`pasted_message_id` in `maya/planning.py`). An ordinary question gets no such ID, so it can never back up a claim.
+- Tests: `tests/test_maya_checklist_citations.py`, `tests/test_maya_pasted_message.py`.
 - This call uses Nova Pro. Nova 2 Lite wrote broken JSON for the nested reply (0 valid out of 8 tries); Nova Pro wrote it 4 out of 4.
 
 ## Tools: database reads only
@@ -59,6 +72,21 @@ Maya loads 5 of the MCP server's 14 tools: `get_employee`, `list_onboarding_task
 - **The write tool** (`create_access_request`) is never loaded, so no fallback can expose it.
 - **The 4 document tools** (`search_hr_documents`, `search_knowledge_base`, `list_policies`, `get_policy`) are never loaded either. They return any document to anyone. Documents come only from Maya's own OpenSearch search, which filters by who is asking.
 - **Effect on the golden dataset:** S2 turns 2, 6 and 9 expect a document tool. Maya's search covers them instead, so the smoke test accepts retrieved evidence in place of those tools.
+
+## When Maya must look things up
+
+The planner decides whether a turn needs database records (`needs_records`). If it does and the model answers without calling a tool, the `rearm` step deletes that answer before the user sees it and retries once with every read tool (`maya/graph.py`).
+
+- **The retry must call a tool** (`must_call_tool`, Bedrock's `tool_choice` "any"). Before, a retry could answer again without one: asked "how do I get my software licenses sorted?", Maya answered from a general handbook page instead of the Webex record showing 42 of 40 seats used. Test: `tests/test_maya_rearm.py`.
+- **A pasted email needs no lookup:** a planner rule says a question about what a pasted thread says ("what here is mine to do?") needs no records, so the retry doesn't force a pointless one (`maya/memory.py`).
+- **Someone's own equipment** (`equipment_request`) may read their onboarding tasks, not only the stock: "am I getting a laptop before the 1st?" is answered by the task with the planned date (`maya/loadout.py`).
+- The step limit is 16 (`RECURSION_LIMIT`): the retry path is longer, and 12 crashed a turn that needed a second tool.
+
+**Answer rules** added to Maya's instructions (`IMPORTANT_POINTERS` in `maya/planning.py`), each with a comment naming the mistake it fixes:
+
+- Name the document an answer comes from; never write as if from a document that wasn't retrieved (asked what "the manager's guide" says, Maya now says she has no access to it).
+- For a pasted thread, list only the user's own items, not other people's.
+- When the user's own rule and a document's rule both apply, give the document's exact rule as the reason (the onboarding session's turn 9 now cites the memo's USD 7,500 threshold in 3 of 4 runs, up from 1 of 4).
 
 ## The Webex handoff (S2 turn 10)
 
@@ -90,6 +118,13 @@ Proof of the durable behaviour (unit tests in `tests/test_webex_steps.py`, no se
 - the write gate needs a recorded approval: `test_the_gate_never_files_without_an_approved_row`, `test_a_go_ahead_message_cannot_approve`.
 
 `W-S-01` turn 4 reuses `AR001` and files nothing, as the spec's reference scenario says. `GOLDEN-DATASETS.json` (S8, the same turn) expects a new `create_access_request`; we follow the spec.
+
+## Evaluating Maya
+
+`python -m evals.run_maya` sends the five Maya items of `data/EVALUATION-INPUTS.yaml` (20 turns) through the agent and checks each turn against `data/GOLDEN-DATASETS.json` (`evals/maya_checks.py`).
+
+- **Binding fields fail the turn; illustrative ones only warn.** The golden file's own notes split its fields: required facts, forbidden facts, forbidden tools, forbidden and expected sources, and whether a lookup was needed are binding; the topic label, tool names and tool arguments describe the course's reference build and are expected to differ. A missed illustrative field prints as a warning (⚠) and is counted in the run record, but doesn't fail the turn. Our own checks (citations, never "granted", the closed tangent, the turn-10 replay) also fail the turn. Test: `tests/test_maya_checks.py` pins which fields can never become warnings.
+- **Results** (one full run varies by about 2 turns): 13-14 of 20 turns pass. Known misses: the promotion answer usually drops the cycle dates (April 1 / October 1) although it cites the section that has them; the laptop turn passes when Maya reads the onboarding task (1 of 3 runs).
 
 ## Tracing (Langfuse)
 
