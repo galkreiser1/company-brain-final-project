@@ -2,8 +2,13 @@
 
 Based on Lesson 7's homework (retrieval.py and reranker.py).
 
-Access rule: a document about one employee (subject_employee_id is set) is visible
-only to HR and to that employee. Every other document is visible to everyone.
+Access rules, from each chunk's audience (set at ingest, maya/ingest.py):
+  - "hr_or_subject": a document about one employee: only HR and that employee;
+  - "manager": the manager playbook: only managers (people someone reports to),
+    HR included only if they manage someone;
+  - "all": everyone.
+Anything else is hidden from everyone (fail closed). The rules are applied inside the
+search itself, so a hidden chunk never reaches the reranker or the model.
 """
 
 from typing import Protocol
@@ -24,7 +29,7 @@ TOP_K = 4
 CANDIDATES = 20
 # The fields each hit returns. The vector itself isn't needed after the search.
 SOURCE_FIELDS = ["doc_id", "chunk_id", "collection", "section", "subject_employee_id",
-                 "updated", "text"]
+                 "audience", "updated", "text"]
 
 
 # 1. WHO MAY SEE WHAT ---------------------------------------------------------
@@ -65,25 +70,41 @@ def authorize_turn(caller: CallerContext | None, plan: ContextPlan) -> bool:
     return authorize(caller, plan.subject_employee_id)
 
 
-def access_filter(caller: CallerContext) -> list[dict]:
-    """The same rule as authorize(), written as OpenSearch filter clauses.
+def may_read(caller: CallerContext, chunk: dict) -> bool:
+    """May this caller read this chunk? The rules in this file's docstring, in Python.
 
-    Gets: the caller.
-    Returns: [] for HR (no limit). For anyone else, one clause: audience is "all"
-    OR the chunk is about the caller.
+    Gets: the caller, and the chunk's fields (audience, subject_employee_id).
+    Returns: True only for an audience the caller is allowed; False for any other,
+    including a missing or unknown audience.
     """
 
+    audience = chunk.get("audience")
+    if audience == "all":
+        return True
+    if audience == "hr_or_subject":
+        return authorize(caller, chunk.get("subject_employee_id"))
+    if audience == "manager":
+        return caller.is_manager
+    return False
+
+
+def access_filter(caller: CallerContext) -> list[dict]:
+    """The same rules as may_read(), written as one OpenSearch filter clause.
+
+    Gets: the caller.
+    Returns: one clause, "at least one of these holds", listing what the caller may
+    read: audience "all"; every employee's file (HR) or their own (anyone else);
+    the manager playbook (managers only). A chunk matching none is never returned.
+    """
+
+    allowed = [{"term": {"audience": "all"}}]
     if caller.user_group == HR_GROUP:
-        return []
-    return [{
-        "bool": {
-            "should": [
-                {"term": {"audience": "all"}},
-                {"term": {"subject_employee_id": caller.caller_id}},
-            ],
-            "minimum_should_match": 1,  # at least one of the two must hold
-        }
-    }]
+        allowed.append({"term": {"audience": "hr_or_subject"}})
+    else:
+        allowed.append({"term": {"subject_employee_id": caller.caller_id}})
+    if caller.is_manager:
+        allowed.append({"term": {"audience": "manager"}})
+    return [{"bool": {"should": allowed, "minimum_should_match": 1}}]
 
 
 # 2. FILTERED VECTOR SEARCH ---------------------------------------------------
@@ -105,8 +126,7 @@ def knn_body(vector: list[float], caller: CallerContext, n: int,
     clauses = access_filter(caller)
     if collections:
         clauses = clauses + [{"terms": {"collection": collections}}]  # any of these
-    if clauses:
-        knn["filter"] = {"bool": {"filter": clauses}}
+    knn["filter"] = {"bool": {"filter": clauses}}
     return {"size": n, "query": {"knn": {"vector": knn}}, "_source": SOURCE_FIELDS}
 
 
@@ -261,7 +281,7 @@ class OpenSearchRetriever:
         candidates = knn_candidates(self.client, query, caller, collections=collections)
         # A second check, in Python, in case the filter is ever wrong: a chunk the
         # caller may not see never reaches the reranker or the agent.
-        allowed = [c for c in candidates if authorize(caller, c["subject_employee_id"])]
+        allowed = [c for c in candidates if may_read(caller, c)]
         if not allowed:
             return []
 

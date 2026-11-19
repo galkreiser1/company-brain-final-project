@@ -15,6 +15,9 @@ class CallerContext(BaseModel):
 
     caller_id: str   # the employee id, e.g. "E001"
     user_group: str  # e.g. "UG_REGULAR", "UG_HR", "UG_IT"
+    # True if someone reports to them (from the database, by code). Only managers may
+    # read the manager playbook. False unless proven: a missing value hides it.
+    is_manager: bool = False
 
 
 class Evidence(BaseModel):

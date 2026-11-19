@@ -105,7 +105,8 @@ def test_searches_once_with_the_plans_query_as_the_caller():
 
     assert len(retriever.calls) == 1
     assert retriever.calls[0]["query"] == "Maya Cohen offer letter"
-    assert retriever.calls[0]["caller"] == CallerContext(**SARA_HR)
+    # Sara manages someone, so the code that builds the caller marks her a manager.
+    assert retriever.calls[0]["caller"] == CallerContext(**SARA_HR, is_manager=True)
     assert [chunk["chunk_id"] for chunk in result["evidence"]] == [
         "employment/maya_cohen_offer_letter.md#0"
     ]

@@ -18,10 +18,18 @@ Model answers vary between runs, so a rerun gives slightly different numbers.
 
 ## Who may see what
 
-**Documents** (Milestone 2, the retrieval pattern from Lesson 7's homework). A document about one employee (an offer letter, an approval profile) is visible only to HR (`UG_HR`) and to that employee. Every other document is visible to everyone.
+**Documents** (Milestone 2, the retrieval pattern from Lesson 7's homework). Each chunk carries an `audience`, set at ingest (`maya/ingest.py`):
 
-- The rule is a filter inside the OpenSearch k-NN query, so a chunk the caller may not see is never even a candidate. A second check in Python drops anything the filter missed (`maya/retrieval.py`).
-- Being someone's manager gives no access. Yael Romano (E018) manages Maya Cohen (E001) but is not in HR, so she can't see Maya's employment files.
+| Audience | Which documents | Who may read them |
+| --- | --- | --- |
+| `hr_or_subject` | about one employee (an offer letter, an approval profile) | HR (`UG_HR`) and that employee |
+| `manager` | `manager_playbook/*` (front matter `audience: manager`) | managers only: someone reports to them in the database (`load_manager_ids`). HR is not enough |
+| `all` | everything else, including `handbook/*` (front matter `audience: all`) | everyone |
+
+- The rule is a filter inside the OpenSearch k-NN query (`access_filter`), so a chunk the caller may not see is never even a candidate: a restricted chunk never reaches the reranker or the model, so there is nothing to refuse after the fact. A second check in Python (`may_read`) drops anything the filter missed (`maya/retrieval.py`).
+- It fails closed: a missing or unknown audience is hidden from everyone, a front matter declaring an unknown audience is skipped at ingest, and a caller is a manager only if the database says so (`CallerContext.is_manager`, set by `caller_from_config` in `maya/graph.py`, never from the run's settings or a message).
+- Being someone's manager gives no access to their files. Yael Romano (E018) manages Maya Cohen (E001) but is not in HR, so she can't see Maya's employment files (she can read the manager playbook).
+- Tests: `tests/test_maya_permissions.py` (the rules, the ingest labels, and against the real index: a non-manager's candidates never include a playbook chunk, a manager's do).
 
 **Questions about a person** (the `authorize` step, which runs right after the plan):
 

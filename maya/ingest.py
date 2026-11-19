@@ -9,8 +9,14 @@ import re
 from pathlib import Path
 
 
-# The collections (folders under documents/) that Maya searches.
-COLLECTIONS = ("employment", "policies", "it_kb", "contracts", "internal_memos")
+# The collections (folders under documents/) that Maya searches. The handbook is for
+# everyone; the manager playbook is for managers only (each file's front matter says so).
+COLLECTIONS = ("employment", "policies", "it_kb", "contracts", "internal_memos",
+               "handbook", "manager_playbook")
+
+# The audiences a document's front matter may declare. Anything else is skipped at
+# ingest: a label we don't understand could mean "restricted", so we don't guess.
+DECLARED_AUDIENCES = ("all", "manager")
 
 # Header lines that name the employee a document is about.
 EMPLOYEE_KEYS = ("Employee", "Employee name")
@@ -22,7 +28,7 @@ ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")  # e.g. 2026-06-01
 # 1. FIND THE DOCUMENTS -------------------------------------------------------
 
 def document_paths(documents_dir: Path) -> list[Path]:
-    """Every .md file in the five collections, in a fixed order."""
+    """Every .md file in the collections, in a fixed order."""
 
     paths = []
     for collection in COLLECTIONS:
@@ -55,6 +61,27 @@ def split_sections(text: str) -> list[tuple[str, str]]:
     return [(heading, body) for heading, body in pieces if body]
 
 
+def front_matter(text: str) -> tuple[dict[str, str], str]:
+    """Split off a document's front matter: the "key: value" lines between two "---"
+    lines at the very top (the handbook and the manager playbook have it).
+
+    Returns: (the keys and values, the text after it). No front matter: ({}, text).
+    """
+
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+    for end, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            fields = {}
+            for field in lines[1:end]:
+                key, colon, value = field.partition(":")
+                if colon:
+                    fields[key.strip()] = value.strip()
+            return fields, "\n".join(lines[end + 1:])
+    return {}, text  # no closing "---": not front matter
+
+
 # 3. READ THE METADATA --------------------------------------------------------
 # Metadata belongs to the whole document, so every chunk of a document shares it.
 
@@ -75,8 +102,35 @@ def load_employee_ids(data_dir: Path) -> dict[str, str]:
     return {person["full_name"]: person["employee_id"] for person in seed["employees"]}
 
 
+def load_manager_ids(data_dir: Path) -> frozenset[str]:
+    """The employees who manage someone: every manager_id in the database seed file.
+    Only they may read the manager playbook."""
+
+    seed = json.loads((data_dir / "database" / "seed.json").read_text(encoding="utf-8"))
+    return frozenset(person["manager_id"] for person in seed["employees"] if person.get("manager_id"))
+
+
 class UnknownEmployee(ValueError):
     """A document names an employee who isn't in the database."""
+
+
+class UnknownAudience(ValueError):
+    """A document's front matter declares an audience we don't know."""
+
+
+def document_audience(declared: str | None, subject: str | None) -> str:
+    """Who may read a document:
+      - "hr_or_subject": it's about one employee (HR or that employee);
+      - "manager": its front matter says audience: manager (managers only);
+      - "all": everyone (front matter says all, or there's no front matter).
+    Raises UnknownAudience for any other declared value.
+    """
+
+    if declared is not None and declared not in DECLARED_AUDIENCES:
+        raise UnknownAudience(f"audience '{declared}' is not one of {DECLARED_AUDIENCES}")
+    if subject:
+        return "hr_or_subject"
+    return declared or "all"
 
 
 def subject_employee_id(text: str, employee_ids: dict[str, str]) -> str | None:
@@ -94,10 +148,11 @@ def subject_employee_id(text: str, employee_ids: dict[str, str]) -> str | None:
     return employee_ids[name]
 
 
-def updated_date(text: str) -> str | None:
-    """The document's date as YYYY-MM-DD, or None if it has no date line."""
+def updated_date(text: str, fields: dict[str, str] | None = None) -> str | None:
+    """The document's date as YYYY-MM-DD, or None if it has no date line. The front
+    matter's last_updated counts first."""
 
-    value = header_value(text, DATE_KEYS)
+    value = (fields or {}).get("last_updated") or header_value(text, DATE_KEYS)
     if value and ISO_DATE.fullmatch(value):
         return value
     return None
@@ -109,11 +164,10 @@ def document_records(path: Path, documents_dir: Path, employee_ids: dict) -> lis
     """One record per chunk of a document. Vectors are added later, by the script."""
 
     doc_id = path.relative_to(documents_dir).as_posix()  # e.g. "policies/expense_policy.md"
-    text = path.read_text(encoding="utf-8")
+    fields, text = front_matter(path.read_text(encoding="utf-8"))
     subject = subject_employee_id(text, employee_ids)
-    # A document about one employee is for HR or that employee; the rest is for all.
-    audience = "hr_or_subject" if subject else "all"
-    updated = updated_date(text)
+    audience = document_audience(fields.get("audience"), subject)
+    updated = updated_date(text, fields)
 
     records = []
     for number, (section, chunk_text) in enumerate(split_sections(text)):
@@ -133,8 +187,9 @@ def document_records(path: Path, documents_dir: Path, employee_ids: dict) -> lis
 def read_records(data_dir: Path) -> tuple[list[dict], list[str]]:
     """Every chunk of every document, as records, plus the documents skipped.
 
-    A document naming an unknown employee is skipped (with the reason), so one bad
-    file doesn't stop the others from being indexed.
+    A document naming an unknown employee, or declaring an unknown audience, is
+    skipped (with the reason), so one bad file doesn't stop the others from being
+    indexed, and nothing is shown to people it may not be meant for.
     """
 
     documents_dir = data_dir / "documents"
@@ -143,6 +198,6 @@ def read_records(data_dir: Path) -> tuple[list[dict], list[str]]:
     for path in document_paths(documents_dir):
         try:
             records.extend(document_records(path, documents_dir, employee_ids))
-        except UnknownEmployee as error:
+        except (UnknownEmployee, UnknownAudience) as error:
             skipped.append(f"{path.relative_to(documents_dir)}: {error}")
     return records, skipped

@@ -26,6 +26,7 @@ Each turn runs these steps:
 Read in this order: AgentState, then the steps, then build_graph at the bottom.
 """
 
+import functools
 from functools import partial
 from typing import Annotated, TypedDict
 
@@ -38,7 +39,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from maya.config import DATA_DIR, RESPOND_MODEL_ID
-from maya.ingest import load_employee_ids
+from maya.ingest import load_employee_ids, load_manager_ids
 from maya.loadout import maya_tools, select_tools
 from maya.memory import (
     ConversationMemory,
@@ -162,7 +163,16 @@ def caller_from_config(config: RunnableConfig) -> CallerContext | None:
     user_group = settings.get("user_group")
     if not caller_id or not user_group:
         return None
-    return CallerContext(caller_id=caller_id, user_group=user_group)
+    return CallerContext(caller_id=caller_id, user_group=user_group,
+                         is_manager=caller_id in manager_ids())
+
+
+@functools.cache
+def manager_ids() -> frozenset[str]:
+    """Everyone who manages someone, read once from the database seed. The org chart
+    isn't changed by any tool, so the seed is its source of truth."""
+
+    return load_manager_ids(DATA_DIR)
 
 
 # The deny path's whole answer. Fixed text, so it can't reveal anything about anyone.
